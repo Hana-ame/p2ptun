@@ -35,9 +35,15 @@ Flags / env:
 | `-peer` | `P2PTUN_PEER` | remote id (connect side) |
 | `-target` | `P2PTUN_TARGET` | exposed TCP endpoint (expose), default `127.0.0.1:22` |
 | `-listen` | `P2PTUN_LISTEN` | local listen addr (connect), default `127.0.0.1:2222` |
-| `-broker` | `P2PTUN_BROKER` | signaling broker, default `wss://0.peerjs.com` |
+| `-broker` | `P2PTUN_BROKER` | signaling broker, default `wss://0.peerjs.com` (备用 `1.peerjs.com`) |
 | `-key` | `P2PTUN_KEY` | PeerJS api key, default `peerjs` |
 | `-stun` | `P2PTUN_STUN` | comma-separated STUN servers |
+| — | `P2PTUN_DNS` | name servers for Termux-safe DNS (default `223.5.5.5,114.114.114.114,8.8.8.8,1.1.1.1`) |
+
+## Documentation
+
+- [`docs/architecture.md`](docs/architecture.md) — signaling / frame protocol / backpressure / session lifecycle
+- [`docs/troubleshooting.md`](docs/troubleshooting.md) — phone-side DNS/CA errors, `[::1]:53` signature, NAT limits
 
 ## Termux
 
@@ -64,6 +70,18 @@ See [`examples/p2ptun.service`](examples/p2ptun.service).
    secret, replies `ANSWER`; both exchange ICE `CANDIDATE`s through the server.
 3. WebRTC DataChannel (ordered/reliable) carries a simple multiplexed frame
    protocol (`SYN`/`DATA`/`FIN` per TCP stream) with `bufferedAmount` backpressure.
+
+## Releases
+
+Published on GitHub: https://github.com/Hana-ame/p2ptun/releases
+
+- `p2ptun_linux_amd64` / `p2ptun_linux_arm64` / `p2ptun_linux_armv7` — Linux (arm64 给 Termux)
+- `p2ptun_windows_amd64.exe` — Windows 上临时跑 connect
+- `SHA256SUMS`
+
+GitHub Actions 的 tag→release 工作流已就绪（`.github/workflows/release.yml`，推 `v*` tag 自动构建）；
+当前仓库 Actions 未启用，启用后即自动发布，否则按 `docs/troubleshooting.md` 手动流程发布。
+手机国内直连 GitHub 不通时，给 release URL 加 `https://gh-proxy.com/` 前缀。
 
 ## Build
 

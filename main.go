@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	version = "0.1.3"
+	version = "0.1.4"
 
 	defaultBroker = "wss://0.peerjs.com"
 	defaultKey    = "peerjs"
@@ -355,6 +355,7 @@ func exposeOnce(cfg config) error {
 	defer sc.shutdown()
 
 	log.Printf("expose: signaling ready id=%s", cfg.id)
+	log.Printf("expose: if remote can't connect: check UDP outbound both sides (docs/troubleshooting.md #5)")
 	log.Printf("expose: connect side command: p2ptun connect -peer %s -secret %s -listen 127.0.0.1:2222",
 		cfg.id, cfg.secret)
 
@@ -590,6 +591,7 @@ func (s *tunnelSess) run() error {
 	defer sc.shutdown()
 
 	log.Printf("connect: signaling ready, sending OFFER to %s", s.peer)
+	log.Printf("connect: if stuck at pc state=connecting: check UDP outbound both sides (docs/troubleshooting.md #5)")
 	offer, err := pc.CreateOffer(nil)
 	if err != nil {
 		return err

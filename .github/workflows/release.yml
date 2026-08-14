@@ -1,0 +1,65 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Build static binaries (CGO off for old glibc / Termux)
+        run: |
+          mkdir -p dist
+          GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/p2ptun_linux_amd64 .
+          GOOS=linux   GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/p2ptun_linux_arm64 .
+          GOOS=linux   GOARCH=arm GOARM=7 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/p2ptun_linux_armv7 .
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/p2ptun_windows_amd64.exe .
+
+      - name: SHA256SUMS
+        run: cd dist && sha256sum * > SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          body="$(git tag --list 'v*' --format='%(contents:body)')"
+          [ -n "$body" ] || body="p2ptun ${{ github.ref_name }}"
+          gh release create "${{ github.ref_name }}" --repo "${{ github.repository }}" \
+            --title "${{ github.ref_name }}" --notes "$body"
+
+      - name: Upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          for f in p2ptun_*; do
+            gh release upload "${{ github.ref_name }}" "$f" --repo "${{ github.repository }}" --clobber
+          done
