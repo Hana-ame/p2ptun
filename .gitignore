@@ -1,0 +1,7 @@
+# binaries
+/p2ptun
+/p2ptun-*
+/dist/
+
+# local
+*.log
