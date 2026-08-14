@@ -66,6 +66,24 @@ v0.1.1+ 已自动附加。升级即解。
 - 对称 NAT 或无 UDP：**只有 TURN 能解，而 TURN 就是数据中继，违反本项目
   "不含转发" 的设计约束，不做**。
 
+## 5.5 第 1 次能连，重跑后一直卡在 connecting（半通）
+
+特征：第一次 OFFER 秒通（`datachannel open`），kill 掉手机进程重跑后，
+下次 OFFER 永远停在 connecting；WSL 侧却是 `pc state=connected` 但**没有**
+`datachannel open`。
+
+原因（v0.1.4 及之前的 bug）：expose 侧复用同一个 PeerConnection 对新 OFFER
+做重协商，pion 不支持给已建立的连接加新 DataChannel → 半通，手机等不到正确
+ANSWER。
+
+v0.1.5 起三个自愈机制解决：
+
+- expose 收到新 OFFER 时若 pc 已在忙 → 直接重建会话（日志 `busy pc=.., restarting session`）
+- expose `connected` 但 30s 无 datachannel → 自动重建
+- connect 侧 15s 内既没连上也没失败（含不答 ANSWER）→ 自动重建重发 OFFER
+
+结论：**双方都升级到 v0.1.5**，重跑再也不会永久卡死，最多 20~30s 自动恢复。
+
 ## 6. WSL 服务端排查
 
 ```bash

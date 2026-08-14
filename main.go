@@ -10,13 +10,14 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/webrtc/v4"
 )
 
 const (
-	version = "0.1.4"
+	version = "0.1.5"
 
 	defaultBroker = "wss://0.peerjs.com"
 	defaultKey    = "peerjs"
@@ -258,6 +259,7 @@ type exposeCtx struct {
 	sc     *signalingClient
 	peer   string // destination peer id (the connect side)
 	connID string
+	cancel func()
 }
 
 func (x *exposeCtx) set(sc *signalingClient, peer, connID string) {
@@ -289,6 +291,7 @@ func exposeOnce(cfg config) error {
 
 	reg := newStreamReg()
 	ctx := &exposeCtx{}
+	ctx.cancel = cancelFn
 	sdp := &sdpState{}
 
 	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{ICEServers: cfg.iceServers()})
@@ -300,9 +303,11 @@ func exposeOnce(cfg config) error {
 	var trMu sync.Mutex
 	var tr *transport
 
+	var dcOpened atomic.Bool
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
 		dc.OnOpen(func() {
 			log.Printf("expose: datachannel open")
+			dcOpened.Store(true)
 			t := newTransport(dc, func(typ uint8, id uint32, payload []byte) {
 				trMu.Lock()
 				cur := tr
@@ -341,6 +346,14 @@ func exposeOnce(cfg config) error {
 			cancelFn()
 		}
 	})
+	// 半通自愈: connected 但 DataChannel 一直没建立 → 30s 后重建会话
+	go func() {
+		time.Sleep(30 * time.Second)
+		if pc.ConnectionState() == webrtc.PeerConnectionStateConnected && !dcOpened.Load() {
+			log.Printf("expose: connected but no datachannel (30s), restarting session")
+			cancelFn()
+		}
+	}()
 
 	var sc *signalingClient
 	sc, err = dialSignaling(cfg.broker, cfg.key, cfg.id, token, func(typ, src string, sig pjSignal) {
@@ -369,6 +382,14 @@ func handleSignalExpose(cfg config, pc *webrtc.PeerConnection, ctx *exposeCtx, s
 	case pjOffer:
 		if sig.Metadata != cfg.secret {
 			log.Printf("expose: REJECT offer from %s: bad secret", src)
+			return
+		}
+		// 同一个 pc 对多次 OFFER 重协商不可靠(pion 对新 DataChannel 支持差,
+		// 会导致 WSL connected 但 datachannel 不 open、手机永远停在 connecting):
+		// 已在忙 → 直接重建会话, 让新 OFFER 落在全新的 pc 上
+		if st := pc.ConnectionState(); st != webrtc.PeerConnectionStateNew {
+			log.Printf("expose: busy pc=%s, restarting session for fresh OFFER", st)
+			ctx.cancel()
 			return
 		}
 		log.Printf("expose: OFFER from %s conn=%s", src, sig.ConnectionID)
@@ -576,6 +597,15 @@ func (s *tunnelSess) run() error {
 			s.cancelFn()
 		}
 	})
+	// ICE 自愈: 15s 内既没连上也没失败(对方不答时 pc 会一直停在 New) → 重建会话
+	go func() {
+		time.Sleep(15 * time.Second)
+		switch pc.ConnectionState() {
+		case webrtc.PeerConnectionStateNew, webrtc.PeerConnectionStateConnecting:
+			log.Printf("connect: ICE stuck (%s) for 15s, restarting session", pc.ConnectionState())
+			s.cancelFn()
+		}
+	}()
 
 	sc, err := dialSignaling(s.cfg.broker, s.cfg.key, s.cfg.id, s.token, func(typ, src string, sig pjSignal) {
 		s.onSignal(typ, src, sig, sdp)

@@ -63,6 +63,9 @@ type: 1=SYN(新流)  2=DATA  3=FIN(对端已关)
   `sdpState` 先缓冲，`onRemoteSet` 后再逐条 `AddICECandidate`。
 - 收尾：`pc state=closed` 是 teardown 里主动 `pc.Close()` 的正常日志，
   **不是错误**——它常紧跟 `session ended: ... (retry in 3s)` 出现。
+- v0.1.5 自愈：新 OFFER 撞上忙碌会话 → expose 自动重建（日志
+  `busy pc=.., restarting session`）；connect 15s 无进展或 expose 30s 无
+  datachannel → 自动重建。双方需同版本。
 
 ## 4. 网络修复（`netfix.go`）
 
