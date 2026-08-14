@@ -16,6 +16,8 @@ import (
 )
 
 const (
+	version = "0.1.3"
+
 	defaultBroker = "wss://0.peerjs.com"
 	defaultKey    = "peerjs"
 	defaultSTUN   = "stun:stun.cloudflare.com:3478,stun:stun.l.google.com:19302,stun:stun.miwifi.com:3478,stun:stun.qq.com:3478"
@@ -32,6 +34,7 @@ func main() {
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	applyNetFix() // Termux 无 resolv.conf / CA 路径修复 (netfix.go)
+	log.Printf("p2ptun %s started (DNS: %s)", version, strings.Join(dnsServers, ", "))
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(2)
@@ -42,7 +45,7 @@ func main() {
 	case "connect":
 		runConnect(os.Args[2:])
 	case "version", "-v", "--version":
-		fmt.Println("p2ptun 0.1.2")
+		fmt.Println("p2ptun " + version)
 	default:
 		usage()
 		os.Exit(2)
