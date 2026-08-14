@@ -42,7 +42,7 @@ func main() {
 	case "connect":
 		runConnect(os.Args[2:])
 	case "version", "-v", "--version":
-		fmt.Println("p2ptun 0.1.1")
+		fmt.Println("p2ptun 0.1.2")
 	default:
 		usage()
 		os.Exit(2)

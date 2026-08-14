@@ -57,11 +57,18 @@ func netResolver() *net.Resolver {
 			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
 				d := net.Dialer{Timeout: 5 * time.Second}
 				var err error
-				for _, dns := range dnsServers {
-					var c net.Conn
-					c, err = d.DialContext(ctx, network, dns)
-					if err == nil {
-						return c, nil
+				// UDP 全部失败时回退 TCP, 兼容只放行 TCP 53 的网络
+				networks := []string{network}
+				if strings.HasPrefix(network, "udp") {
+					networks = append(networks, strings.Replace(network, "udp", "tcp", 1))
+				}
+				for _, nw := range networks {
+					for _, dns := range dnsServers {
+						var c net.Conn
+						c, err = d.DialContext(ctx, nw, dns)
+						if err == nil {
+							return c, nil
+						}
 					}
 				}
 				return nil, err
