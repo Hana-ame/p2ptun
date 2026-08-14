@@ -49,6 +49,10 @@ P2PTUN_PEER=wslssh-a1b2 P2PTUN_SECRET=hunter2 p2ptun connect
 termux-wake-lock   # keep phone awake
 ```
 
+> Termux/Android 特有问题已内置修复，无需配置：Termux 没有
+> `/etc/resolv.conf`，程序固定走公共 DNS（`P2PTUN_DNS` 可覆盖）；
+> 证书会自动附加 `$PREFIX/etc/tls/cert.pem`。
+
 ## systemd (WSL / Linux)
 
 See [`examples/p2ptun.service`](examples/p2ptun.service).

@@ -86,7 +86,7 @@ func dialSignaling(broker, key, id, token string, onSignal func(string, string, 
 	h.Set("Origin", "https://peerjs.com")
 	h.Set("User-Agent", "Mozilla/5.0 (p2ptun)")
 
-	ws, resp, err := websocket.DefaultDialer.Dial(u, h)
+	ws, resp, err := wsDialer().Dial(u, h)
 	if err != nil {
 		if resp != nil {
 			return nil, fmt.Errorf("dial: %v (http %d)", err, resp.StatusCode)

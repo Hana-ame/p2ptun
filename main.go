@@ -31,6 +31,7 @@ func main() {
 	}
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	applyNetFix() // Termux 无 resolv.conf / CA 路径修复 (netfix.go)
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(2)
@@ -41,7 +42,7 @@ func main() {
 	case "connect":
 		runConnect(os.Args[2:])
 	case "version", "-v", "--version":
-		fmt.Println("p2ptun 0.1.0")
+		fmt.Println("p2ptun 0.1.1")
 	default:
 		usage()
 		os.Exit(2)
