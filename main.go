@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	version = "0.1.5"
+	version = "0.1.6"
 
 	defaultBroker = "wss://0.peerjs.com"
 	defaultKey    = "peerjs"
