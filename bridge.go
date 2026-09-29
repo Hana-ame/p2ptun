@@ -108,13 +108,17 @@ func (t *transport) close() {
 
 // stream bridges one TCP connection over the tunnel. ch is intentionally never
 // closed (a send-select on a closed channel panics); streams are torn down by
-// closing conn, which makes both pump goroutines exit.
+// closing conn, which makes both pump goroutines exit. The FIN path uses
+// halfClose(): drain everything already queued in ch before closing conn, so a
+// response that raced ahead of the FIN is not dropped.
 type stream struct {
 	id      uint32
 	conn    net.Conn
 	ch      chan []byte // data destined to the TCP socket
 	stopped chan struct{}
+	finCh   chan struct{} // closed when FIN received -> drain ch, then close conn
 	once    sync.Once
+	finOnce sync.Once
 }
 
 func (s *stream) stop() {
@@ -124,6 +128,12 @@ func (s *stream) stop() {
 			s.conn.Close()
 		}
 	})
+}
+
+// halfClose signals "no more DATA frames will arrive on this stream"; the
+// DC->TCP pump drains the remaining ch without dropping bytes, then closes conn.
+func (s *stream) halfClose() {
+	s.finOnce.Do(func() { close(s.finCh) })
 }
 
 // connToDC pumps TCP -> DataChannel DATA frames, then FIN on EOF.
@@ -143,16 +153,41 @@ func connToDC(conn net.Conn, id uint32, send func(typ uint8, payload []byte) err
 	send(frameFin, nil)
 }
 
-// dcToConn pumps DataChannel DATA frames -> TCP writes.
-func dcToConn(conn net.Conn, ch <-chan []byte, done func()) {
+// dcToConn pumps DataChannel DATA frames -> TCP writes. On FIN it first drains
+// everything already queued in ch (the FIN arrives after all prior DATA on an
+// ordered DataChannel), writes it to conn, and only then closes the TCP
+// connection — without this, a response that raced the FIN would be dropped and
+// the client would see an empty reply.
+func dcToConn(conn net.Conn, st *stream, done func()) {
 	defer func() {
 		if done != nil {
 			done()
 		}
 	}()
-	for p := range ch {
+	write := func(p []byte) bool {
 		if _, err := conn.Write(p); err != nil {
-			return
+			return false
+		}
+		return true
+	}
+	for {
+		select {
+		case p := <-st.ch:
+			if !write(p) {
+				return
+			}
+		case <-st.finCh:
+			for {
+				select {
+				case p := <-st.ch:
+					if !write(p) {
+						return
+					}
+				default:
+					st.conn.Close()
+					return
+				}
+			}
 		}
 	}
 }

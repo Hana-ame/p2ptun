@@ -424,7 +424,7 @@ func handleSignalExpose(cfg config, pc *webrtc.PeerConnection, ctx *exposeCtx, s
 func handleFrameExpose(cfg config, reg *streamReg, tr *transport, typ uint8, id uint32, payload []byte) {
 	switch typ {
 	case frameSyn:
-		st := &stream{id: id, ch: make(chan []byte, 1024), stopped: make(chan struct{})}
+		st := &stream{id: id, ch: make(chan []byte, 1024), stopped: make(chan struct{}), finCh: make(chan struct{})}
 		reg.add(st)
 		go func() {
 			conn, err := net.DialTimeout("tcp", cfg.target, 5*time.Second)
@@ -437,7 +437,7 @@ func handleFrameExpose(cfg config, reg *streamReg, tr *transport, typ uint8, id 
 			}
 			st.conn = conn
 			go connToDC(conn, id, func(tt uint8, p []byte) error { return tr.send(tt, id, p) })
-			go dcToConn(conn, st.ch, nil)
+			go dcToConn(conn, st, nil)
 		}()
 	case frameData:
 		st := reg.get(id)
@@ -450,7 +450,7 @@ func handleFrameExpose(cfg config, reg *streamReg, tr *transport, typ uint8, id 
 		}
 	case frameFin:
 		if st := reg.get(id); st != nil {
-			st.stop()
+			st.halfClose()
 			reg.remove(id)
 		}
 	}
@@ -687,10 +687,10 @@ func (s *tunnelSess) registerConn(c net.Conn) {
 		return
 	}
 	id := s.reg.allocID()
-	st := &stream{id: id, conn: c, ch: make(chan []byte, 1024), stopped: make(chan struct{})}
+	st := &stream{id: id, conn: c, ch: make(chan []byte, 1024), stopped: make(chan struct{}), finCh: make(chan struct{})}
 	s.reg.add(st)
 	go connToDC(c, id, func(tt uint8, p []byte) error { return s.tr.send(tt, id, p) })
-	go dcToConn(c, st.ch, nil)
+	go dcToConn(c, st, nil)
 	if err := s.tr.send(frameSyn, id, nil); err != nil {
 		log.Printf("connect: SYN failed: %v", err)
 		st.stop()
@@ -722,7 +722,7 @@ func handleFrameConnect(reg *streamReg, tr *transport, typ uint8, id uint32, pay
 		}
 	case frameFin:
 		if st := reg.get(id); st != nil {
-			st.stop()
+			st.halfClose()
 			reg.remove(id)
 		}
 	}
