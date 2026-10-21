@@ -16,29 +16,106 @@ Termux / remote client          WSL / service owner
          └────────────► PeerJS cloud <──────┘
 ```
 
-## Usage
+## Install
+
+From [GitHub Releases](https://github.com/Hana-ame/p2ptun/releases)（手机国内直连不通时给 URL 加 `https://gh-proxy.com/` 前缀）:
 
 ```sh
-# service owner (e.g. WSL, sshd on 127.0.0.1:22)
-P2PTUN_ID=wslssh-a1b2 P2PTUN_SECRET=hunter2 p2ptun expose
+# Termux / Android (arm64)
+curl -L -o p2ptun https://github.com/Hana-ame/p2ptun/releases/latest/download/p2ptun_linux_arm64
+chmod +x p2ptun && mv p2ptun $PREFIX/bin/
 
-# remote client (e.g. Termux) — then: ssh -p 2222 user@127.0.0.1
-P2PTUN_PEER=wslssh-a1b2 P2PTUN_SECRET=hunter2 p2ptun connect -listen 127.0.0.1:2222
+# Linux x86_64
+curl -L -o p2ptun https://github.com/Hana-ame/p2ptun/releases/latest/download/p2ptun_linux_amd64
+chmod +x p2ptun && sudo mv p2ptun /usr/local/bin/
+
+# Windows PowerShell (临时跑 connect)
+curl.exe -L -O https://github.com/Hana-ame/p2ptun/releases/latest/download/p2ptun_windows_amd64.exe
+
+# 校验（可选）
+curl -L -O https://github.com/Hana-ame/p2ptun/releases/latest/download/SHA256SUMS && sha256sum -c SHA256SUMS
 ```
 
-Flags / env:
+## Quick start: remote SSH (最常用)
+
+**1. 服务端** —— 在 TCP 服务所在机器（如 WSL，sshd 在 `127.0.0.1:22`）运行：
+
+```sh
+p2ptun expose -id wslssh-a1b2 -secret hunter2
+```
+
+**2. 客户端** —— 在远端（如 Termux）运行：
+
+```sh
+p2ptun connect -peer wslssh-a1b2 -secret hunter2 -listen 127.0.0.1:2222
+```
+
+**3. 连接：**
+
+```sh
+ssh -p 2222 user@127.0.0.1
+```
+
+连上后日志会打印 `tunnel established`；两端断线后都自动重连（固定 3s 重试），expose 端常驻等下一个 connect。
+
+## Commands
+
+### `p2ptun expose` — 暴露本机 TCP 服务（在服务所在机器跑）
+
+```sh
+p2ptun expose -secret SECRET [-id MYID] [-target HOST:PORT] [-stun csv]
+```
+
+- `-target` / `P2PTUN_TARGET`：要暴露的 TCP 端点，默认 `127.0.0.1:22`(sshd)。任何 TCP 服务都行：
+  ```sh
+  p2ptun expose -secret hunter2 -target 127.0.0.1:5173   # vite dev server
+  p2ptun expose -secret hunter2 -target 127.0.0.1:8080   # 任一 HTTP 服务
+  ```
+- `-id` 省略时自动生成 `wslssh-<rand4>`，启动日志里能看到，把它填到客户端的 `-peer`。
+- 一次服务一条 DataChannel（单个 connect）；对端断开后 3s 自动回到等待状态。
+
+### `p2ptun connect` — 接入远端服务（在另一侧机器跑）
+
+```sh
+p2ptun connect -peer REMOTE_ID -secret SECRET [-listen HOST:PORT] [-stun csv]
+```
+
+- `-listen` / `P2PTUN_LISTEN`：本地监听地址，默认 `127.0.0.1:2222`。连上后访问该端口即等于访问对端 `-target`。
+- `-peer` 必填 = expose 端的 `-id`。
+- 本地 id 省略时自动生成 `phone-<rand4>`。
+
+## Flags / env (两端通用)
 
 | flag | env | description |
 |---|---|---|
-| `-id` | `P2PTUN_ID` | peer id on the signaling server |
-| `-secret` | `P2PTUN_SECRET` | pairing secret, must match on both sides |
-| `-peer` | `P2PTUN_PEER` | remote id (connect side) |
-| `-target` | `P2PTUN_TARGET` | exposed TCP endpoint (expose), default `127.0.0.1:22` |
-| `-listen` | `P2PTUN_LISTEN` | local listen addr (connect), default `127.0.0.1:2222` |
-| `-broker` | `P2PTUN_BROKER` | signaling broker, default `wss://0.peerjs.com` (备用 `1.peerjs.com`) |
-| `-key` | `P2PTUN_KEY` | PeerJS api key, default `peerjs` |
-| `-stun` | `P2PTUN_STUN` | comma-separated STUN servers |
-| — | `P2PTUN_DNS` | name servers for Termux-safe DNS (default `223.5.5.5,114.114.114.114,8.8.8.8,1.1.1.1`) |
+| `-id` | `P2PTUN_ID` | 自己在信令服务器上的 peer id（省略则自动生成） |
+| `-secret` | `P2PTUN_SECRET` | 配对密钥，两端必须一致 (**必填**) |
+| `-peer` | `P2PTUN_PEER` | 对端 id（仅 connect 需要） |
+| `-target` | `P2PTUN_TARGET` | 暴露的 TCP 端点（仅 expose），默认 `127.0.0.1:22` |
+| `-listen` | `P2PTUN_LISTEN` | 本地监听地址（仅 connect），默认 `127.0.0.1:2222` |
+| `-broker` | `P2PTUN_BROKER` | 信令服务器，默认 `wss://0.peerjs.com`（备用 `wss://1.peerjs.com`） |
+| `-key` | `P2PTUN_KEY` | PeerJS api key，默认 `peerjs` |
+| `-stun` | `P2PTUN_STUN` | STUN 服务器逗号分隔。默认 `stun:stun.cloudflare.com:3478,stun:stun.l.google.com:19302,stun:stun.miwifi.com:3478,stun:stun.qq.com:3478` |
+| — | `P2PTUN_DNS` | Termux 安全 DNS（默认 `223.5.5.5,114.114.114.114,8.8.8.8,1.1.1.1`），一般不用动 |
+
+## More examples
+
+```sh
+# 手机访问 WSL 上的 vite dev server (5173)
+# WSL:
+p2ptun expose -id myvite -secret s1 -target 127.0.0.1:5173
+# 手机浏览器打开 http://127.0.0.1:5173
+P2PTUN_PEER=myvite P2PTUN_SECRET=s1 p2ptun connect -listen 127.0.0.1:5173
+
+# 反过来：WSL 访问手机 Termux 上的服务（方向对称，谁有服务谁 expose）
+# Termux:
+p2ptun expose -id phonehttp -secret s2 -target 127.0.0.1:8000
+# WSL:
+p2ptun connect -peer phonehttp -secret s2 -listen 127.0.0.1:8000
+
+# 不想固定 id？两端都省略 -id/-peer 不行（connect 需要知道对端），
+# 先跑一次 expose 从日志抄下自动生成的 id 再填进 connect 即可。
+```
 
 ## Documentation
 
