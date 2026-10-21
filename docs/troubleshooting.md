@@ -1,105 +1,68 @@
-# 故障排查
+# 故障排查 (v0.2.0)
 
-先分清报错是**旧版还是新版**：日志第一行会打印
-`p2ptun <version> started (DNS: ...)`。旧版（v0.1.0）没有任何版本行。
+日志第一行会打印 `p2ptun 0.2.0 started (DNS: ...)`。也可随时通过 `p2ptun status` 查看当前守护进程状态、RTT、重连次数和最近错误。
 
-## 1. 手机: `lookup ... on [::1]:53: connection refused`
+## 1. 常驻运行与状态检查
 
-```
-connect: session ended: dial: dial tcp: lookup 0.peerjs.com on [::1]:53:
-        read udp [::1]:4xxxx->[::1]:53: read: connection refused (retry in 3s)
-```
-
-**这是 v0.1.0 独有的报错**。Termux 没有 `/etc/resolv.conf`，Go 解析器就
-去连 `[::1]:53`——本机根本没有 DNS 服务，秒拒，然后每 3 秒重试一次
-（每次重试后面跟一行 `pc state=closed`，那是 teardown 的正常清理，别当成新错误）。
-
-解法：升级到 **v0.1.1+**（固定公共 DNS + Termux CA）。
-
+### Termux 手机端常驻
 ```bash
-pkill -f p2ptun 2>/dev/null          # 杀掉旧进程, 替换文件不杀进程
-curl -fLO https://github.com/Hana-ame/p2ptun/releases/download/v0.1.3/p2ptun_linux_arm64
-# 国内不通: https://gh-proxy.com/https://github.com/Hana-ame/p2ptun/releases/download/v0.1.3/p2ptun_linux_arm64
-mv p2ptun_linux_arm64 $PREFIX/bin/p2ptun && chmod +x $PREFIX/bin/p2ptun
-p2ptun version        # 必须输出: p2ptun 0.1.x (≥0.1.1)
-bash p2ptun-run.sh    # 全新终端重跑
+# 启动后台守护进程 (自动写入 ~/.p2ptun/p2ptun-connect.log 并轮转)
+P2PTUN_PEER=wslssh-a1b2 P2PTUN_SECRET=hunter2 p2ptun connect -daemon -status-addr 127.0.0.1:9222
+termux-wake-lock
+
+# 查看运行状态与实时 RTT
+p2ptun status -status-addr 127.0.0.1:9222
+
+# 优雅停止 (会自动向信令服发送 LEAVE 释放 ID)
+p2ptun stop
 ```
 
-升级后若仍 `[::1]:53`：说明跑的还是旧文件/旧进程——`which -a p2ptun`、
-`ls -l $PREFIX/bin/p2ptun`（应约 9.5MB，太小是 curl 中途产物）。
+或者使用仓库自带的 `scripts/termux-daemon.sh`：
+```bash
+P2PTUN_PEER=wslssh-a1b2 P2PTUN_SECRET=hunter2 bash scripts/termux-daemon.sh start
+bash scripts/termux-daemon.sh status
+bash scripts/termux-daemon.sh install-boot   # 安装 Termux 开机自启
+```
 
-## 2. 手机: `certificate signed by unknown authority`
+### WSL / Linux 服务端常驻
+```bash
+sudo bash scripts/install-systemd.sh expose wslssh-a1b2 hunter2 127.0.0.1:22
+systemctl status p2ptun
+journalctl -u p2ptun -n 50 --no-pager
+```
 
-v0.1.0 的另一个问题：Termux CA 在 `$PREFIX/etc/tls/cert.pem`，Go 默认找不到。
-v0.1.1+ 已自动附加。升级即解。
+## 2. 信令连接不上 (`dial wss://0.peerjs.com ...`)
 
-## 3. 新版仍 `dial: ... connection refused (retry in 3s)`
+v0.2.0 已内置三层自动容灾：
+1. **多信令服自动切换**：默认依次尝试 `wss://0.peerjs.com` 与 `wss://1.peerjs.com`。
+2. **真实 DNS 探测 + TCP 53 自动回退**：启动时自动探测最快 DNS；若校园网/企业网封锁 UDP 53，自动切换 TCP 53。
+3. **系统代理自动回退**：若直连信令失败且环境变量原本配置了代理（如 `HTTPS_PROXY`），会自动回退通过代理连接信令。也可显式传 `-proxy http://127.0.0.1:7890`。
 
-新版报错会写**具体 DNS 服务器**（如 `on 223.5.5.5:53`）或直接连不上 broker。
-可能是：
+## 3. 多次重连或切换网络 (Wi-Fi <-> 5G)
 
-- 手机当前网络出不了境外 wss：把 broker 换成备用的
-  `P2PTUN_BROKER=wss://1.peerjs.com` 试试（都连不通 → 换网络）。
-- DNS 被污染：`export P2PTUN_DNS=223.5.5.5:53,114.114.114.114:53`。
-- 信令通了但一直 `pc state=connecting` → 看第 5 条。
+v0.2.0 对多次连接做了彻底重构：
+- **服务端信令常驻不重启**：`expose` 端信令长连接常驻，可同时接待多个客户端（`-max-peers 16`），收到重连 `OFFER` 时毫秒级原地应答，不再出现旧版 `busy pc=..., restarting session` 丢包等待 18 秒的问题。
+- **网卡切换秒级自愈**：内置网卡 IP 监听，手机在 Wi-Fi 与移动数据间切换时立即触发重连（首次重连仅等待 400ms）。
+- **DataChannel 心跳检测**：每 10 秒发送 `PING`/`PONG` 帧保活 NAT 映射并检测静默死连接。
 
-## 4. `pc state=closed`
+## 4. 卡在 `pc state=connecting`（严格对称 NAT 或 UDP 被禁）
 
-不是错误。它是每次会话收尾 `pc.Close()` 的正常日志，几乎总是跟在
-`session ended: ... (retry in 3s)` 之后同一瞬间出现。看问题看 session ended 那行。
+判断两端 UDP 是否通畅：
+```bash
+nc -u -w3 -z stun.cloudflare.com 3478 && echo UDP-OK
+```
 
-## 5. 卡在 `pc state=connecting`（ICE 打洞失败）
-
-| 症状 | 含义 |
-|---|---|
-| 两端都 `connected` | ✅ 通了 |
-| 一直 `connecting`，几秒后 `failed` | 打洞失败 |
-
-判断/处理：
-
-- 服务端（WSL）的 `/etc/resolv.conf` 网络、以及两端 UDP 是否被过滤：
+- 如果两端都是对称型 NAT（如部分移动运营商 4G/5G CGNAT）或企业防火墙完全封死 UDP：
+  v0.2.0 新增了可选的 **TURN 中继支持**（仅在配置 `-turn` 时启用，未配置时保持 100% 纯 P2P）：
   ```bash
-  # 两端各跑一次, 看 STUN(srflx) 是否能拿到公网 IP
-  nc -u -w3 -z stun.cloudflare.com 3478 && echo UDP-OK   # WSL 上测试
+  # 两端同时加上 -turn 参数 (支持 udp / tcp / tls TURN):
+  p2ptun expose  -id wslssh-a1b2 -secret hunter2 -turn "turn:user:pass@your.turn.server:3478?transport=udp"
+  p2ptun connect -peer wslssh-a1b2 -secret hunter2 -turn "turn:user:pass@your.turn.server:3478?transport=udp"
+  # 若网络完全禁止 UDP, 可加 -force-relay 与 ?transport=tcp
   ```
-- 手机用 Wi-Fi / 4G / 热点各试一次；真机网络通常能通，沙箱/公司网络常过滤 UDP。
-- 对称 NAT 或无 UDP：**只有 TURN 能解，而 TURN 就是数据中继，违反本项目
-  "不含转发" 的设计约束，不做**。
+- 如果服务端所在公网机器做了端口映射或有固定公网 IP，可使用 `-ice-ports 50000-50100 -nat1to1 <公网IP>` 显著提升直连成功率。
 
-## 5.5 第 1 次能连，重跑后一直卡在 connecting（半通）
+## 5. `peer id already taken` (`ID-TAKEN`)
 
-特征：第一次 OFFER 秒通（`datachannel open`），kill 掉手机进程重跑后，
-下次 OFFER 永远停在 connecting；WSL 侧却是 `pc state=connected` 但**没有**
-`datachannel open`。
-
-原因（v0.1.4 及之前的 bug）：expose 侧复用同一个 PeerConnection 对新 OFFER
-做重协商，pion 不支持给已建立的连接加新 DataChannel → 半通，手机等不到正确
-ANSWER。
-
-v0.1.5 起三个自愈机制解决：
-
-- expose 收到新 OFFER 时若 pc 已在忙 → 直接重建会话（日志 `busy pc=.., restarting session`）
-- expose `connected` 但 30s 无 datachannel → 自动重建
-- connect 侧 15s 内既没连上也没失败（含不答 ANSWER）→ 自动重建重发 OFFER
-
-结论：**双方都升级到 v0.1.5**，重跑再也不会永久卡死，最多 20~30s 自动恢复。
-
-## 6. WSL 服务端排查
-
-```bash
-systemctl status p2ptun          # active?
-journalctl -u p2ptun -n 50 --no-pager   # 看 expose 侧完整日志
-```
-
-正常情况：`signaling ready id=wslssh-..` 常驻，两侧连上时出现
-`pc state=connected` + `data channel open`。它的日志里也会打印
-connect 侧该用的命令（含当前 secret）。
-
-## 7. 下载/传输
-
-- 国内 GitHub 直连超时：给 release URL 加前缀 `https://gh-proxy.com/`
-  （见第 1 条命令）。
-- 或用 adb：`adb push p2ptun-arm64 /sdcard/Download/`，Termux 里
-  `bash p2ptun-in-termux.sh /sdcard/Download/p2ptun-arm64`。
-- Windows 机器上传：`C:\Users\lumin\p2ptun-arm64` 是仓库现成包
-  （每次 Release 后同步）。
+- 当进程被 `kill -9` 强杀或断电时，PeerJS 云服务器可能保留旧 ID 约 15~30 秒。
+- v0.2.0 在正常停止（`Ctrl-C`、`SIGTERM`、`p2ptun stop`）时会自动关闭连接释放 ID；若遇异常断网后的 `ID-TAKEN`，`expose` 端会自动退避等待云端清理后重连，`connect` 端（未指定固定 `-id` 时）会自动轮换新随机 ID 立即连上。

@@ -1,0 +1,25 @@
+# Example systemd unit for the connect side (client Linux box / workstation).
+# Adjust User/Group and /etc/p2ptun/connect.env, then:
+#   sudo install -m 0644 examples/p2ptun-connect.service /etc/systemd/system/p2ptun-connect.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now p2ptun-connect
+
+[Unit]
+Description=p2ptun connect daemon (P2P TCP tunnel client)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=YOURUSER
+Group=YOURGROUP
+EnvironmentFile=/etc/p2ptun/connect.env
+ExecStart=/usr/local/bin/p2ptun connect
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
