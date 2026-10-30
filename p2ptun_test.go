@@ -264,7 +264,7 @@ func TestRotatingLogAndStatusServer(t *testing.T) {
 	stop := make(chan struct{})
 	defer close(stop)
 	globalStats.signalingUp.Store(true)
-	lis, err := startStatusServer("127.0.0.1:0", stop)
+	lis, err := startStatusServer("127.0.0.1:0", stop, nil)
 	if err != nil {
 		t.Fatalf("startStatusServer: %v", err)
 	}

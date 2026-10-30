@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -515,6 +516,7 @@ func runExpose(args []string) {
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 
+	waitFirstDNSProbe(400 * time.Millisecond)
 	mgr := newExposeManager(cfg, stop)
 	globalStats.mode = "expose"
 	globalStats.peerID = cfg.id
@@ -522,7 +524,7 @@ func runExpose(args []string) {
 	globalStats.setTriggerReconnect(mgr.forceSignalingReconnect)
 
 	if cfg.statusAddr != "" {
-		if _, err := startStatusServer(cfg.statusAddr, stop); err != nil {
+		if _, err := startStatusServer(cfg.statusAddr, stop, closeStop); err != nil {
 			log.Printf("expose: status server warning: %v", err)
 		}
 	}
@@ -557,31 +559,36 @@ type exposeSession struct {
 	pc       *webrtc.PeerConnection
 	sdp      *sdpState
 	reg      *streamReg
+	ctx      context.Context
+	cancel   context.CancelFunc
 	trMu     sync.Mutex
 	tr       *transport
 	dcOpened atomic.Bool
 	closed   atomic.Bool
 	done     chan struct{}
 	once     sync.Once
-	onDone   func(key string)
+	onDone   func(*exposeSession)
 }
 
 func (es *exposeSession) close() {
 	es.once.Do(func() {
 		es.closed.Store(true)
+		if es.cancel != nil {
+			es.cancel() // 取消该会话内所有挂起的拨号
+		}
 		close(es.done)
 		es.trMu.Lock()
 		tr := es.tr
 		es.trMu.Unlock()
 		if tr != nil {
-			tr.close()
+			tr.closeNoNotify() // 防止 sync.Once 重入死锁 (close() 是 transport 的 onClose)
 		}
 		es.reg.closeAll()
 		if es.pc != nil {
 			_ = es.pc.Close()
 		}
 		if es.onDone != nil {
-			es.onDone(es.key)
+			es.onDone(es)
 		}
 	})
 }
@@ -641,9 +648,12 @@ func (m *exposeManager) closeAllSessions(notifyLeave bool) {
 	}
 }
 
-func (m *exposeManager) removeSession(key string) {
+// removeSession 只删除"自己"这个会话: 迟到的旧会话回调不会误删同 key 的新会话。
+func (m *exposeManager) removeSession(sess *exposeSession) {
 	m.mu.Lock()
-	delete(m.sessions, key)
+	if cur, ok := m.sessions[sess.key]; ok && cur == sess {
+		delete(m.sessions, sess.key)
+	}
 	n := len(m.sessions)
 	m.mu.Unlock()
 	globalStats.activePeers.Store(int64(n))
@@ -737,8 +747,10 @@ func (m *exposeManager) runSignalingLoop() error {
 	globalStats.signalingUp.Store(true)
 	globalStats.currentBroker.Store(sc.broker)
 	log.Printf("expose: signaling ready id=%s broker=%s", m.cfg.id, sc.broker)
-	log.Printf("expose: connect side command: p2ptun connect -peer %s -secret %s -listen 127.0.0.1:2222",
-		m.cfg.id, m.cfg.secret)
+	// 配对密钥绝不能进日志: 日志默认落在 ~/.p2ptun/, 历史版本还是 0644 可读.
+	// 这里只打印可直接复制的命令骨架, 密钥由使用者自行填入.
+	log.Printf("expose: connect side command: p2ptun connect -peer %s -secret <SECRET> -listen 127.0.0.1:2222",
+		m.cfg.id)
 
 	select {
 	case <-m.stop:
@@ -848,6 +860,7 @@ func (m *exposeManager) acceptOffer(src string, sig pjSignal) {
 		return
 	}
 
+	sessCtx, sessCancel := context.WithCancel(context.Background())
 	sess := &exposeSession{
 		key:    key,
 		peer:   src,
@@ -856,6 +869,8 @@ func (m *exposeManager) acceptOffer(src string, sig pjSignal) {
 		pc:     pc,
 		sdp:    &sdpState{},
 		reg:    newStreamReg(),
+		ctx:    sessCtx,
+		cancel: sessCancel,
 		done:   make(chan struct{}),
 		onDone: m.removeSession,
 	}
@@ -870,15 +885,16 @@ func (m *exposeManager) acceptOffer(src string, sig pjSignal) {
 		dc.OnOpen(func() {
 			log.Printf("expose: [%s] datachannel open", key)
 			sess.dcOpened.Store(true)
-			t := newTransport(dc, func(typ uint8, id uint32, payload []byte) {
-				sess.trMu.Lock()
-				cur := sess.tr
-				sess.trMu.Unlock()
-				if cur != nil {
-					handleFrameExpose(m.cfg, sess.reg, cur, typ, id, payload)
+			// handler 在 OnMessage 注册前拿到 transport 自身, 首帧不会因为
+			// sess.tr 尚未赋值而被丢弃 (OnOpen 与 OnMessage 在不同协程).
+			t := newTransport(dc, func(t *transport) frameHandler {
+				return func(typ uint8, id uint32, payload []byte) {
+					if sess.closed.Load() {
+						return
+					}
+					handleFrameExpose(m.cfg, sess.reg, t, sess.ctx, typ, id, payload)
 				}
-			})
-			t.setOnClose(sess.close)
+			}, sess.close)
 			t.startKeepalive(m.cfg.keepalive)
 			sess.trMu.Lock()
 			sess.tr = t
@@ -966,13 +982,33 @@ func (m *exposeManager) acceptOffer(src string, sig pjSignal) {
 	sess.sdp.onRemoteSet(pc)
 }
 
-func handleFrameExpose(cfg config, reg *streamReg, tr *transport, typ uint8, id uint32, payload []byte) {
+func handleFrameExpose(cfg config, reg *streamReg, tr *transport, sessCtx context.Context, typ uint8, id uint32, payload []byte) {
+	if sessCtx == nil {
+		sessCtx = context.Background()
+	}
 	switch typ {
 	case frameSyn:
+		// 限制单会话并发流数, 避免对端洪泛 frameSyn 时每个都挂一个 5s 拨号协程和 FD.
+		if reg.count() >= maxStreamsPerSession {
+			log.Printf("expose: too many streams (%d), rejecting SYN id=%d", reg.count(), id)
+			_ = tr.send(frameRst, id, nil)
+			return
+		}
 		st := newStream(id, nil)
 		reg.add(st)
 		go func() {
-			conn, err := net.DialTimeout("tcp", cfg.target, 5*time.Second)
+			dialCtx, cancel := context.WithCancel(sessCtx)
+			defer cancel()
+			watched := make(chan struct{})
+			go func() {
+				select {
+				case <-st.stopped:
+					cancel() // RST/会话关闭时立即取消挂起拨号
+				case <-watched:
+				}
+			}()
+			conn, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(dialCtx, "tcp", cfg.target)
+			close(watched)
 			if err != nil {
 				log.Printf("expose: dial %s: %v", cfg.target, err)
 				_ = tr.send(frameRst, id, nil)
@@ -1049,16 +1085,11 @@ func runConnect(args []string) {
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 
+	waitFirstDNSProbe(400 * time.Millisecond)
 	globalStats.mode = "connect"
 	globalStats.peerID = cfg.id
 	globalStats.remotePeer = cfg.peer
 	globalStats.targetOrLis = cfg.listen
-
-	if cfg.statusAddr != "" {
-		if _, err := startStatusServer(cfg.statusAddr, stop); err != nil {
-			log.Printf("connect: status server warning: %v", err)
-		}
-	}
 
 	connCh := make(chan pendingConn, 128)
 	wakeCh := make(chan struct{}, 1)
@@ -1080,6 +1111,26 @@ func runConnect(args []string) {
 	}
 	globalStats.setTriggerReconnect(forceReconnect)
 
+	// shutdown 是完整优雅退出: 关 stop、关监听、取消当前会话.
+	// 信号与 status server 的 /quit 共用, 避免 /quit 只关 stop 而主循环
+	// 仍卡在 sess.run() 里退不出来 (Windows 上 stop 命令依赖 /quit).
+	shutdown := func() {
+		closeStop()
+		_ = lis.Close()
+		activeSessMu.Lock()
+		s := activeSess
+		activeSessMu.Unlock()
+		if s != nil {
+			s.cancelFn()
+		}
+	}
+
+	if cfg.statusAddr != "" {
+		if _, err := startStatusServer(cfg.statusAddr, stop, shutdown); err != nil {
+			log.Printf("connect: status server warning: %v", err)
+		}
+	}
+
 	go func() {
 		for sig := range sigCh {
 			if sig == syscall.SIGHUP {
@@ -1088,14 +1139,7 @@ func runConnect(args []string) {
 				continue
 			}
 			log.Printf("connect: received %v, shutting down gracefully...", sig)
-			closeStop()
-			_ = lis.Close()
-			activeSessMu.Lock()
-			s := activeSess
-			activeSessMu.Unlock()
-			if s != nil {
-				s.cancelFn()
-			}
+			shutdown()
 			return
 		}
 	}()
@@ -1118,12 +1162,13 @@ func runConnect(args []string) {
 				}
 			}
 			tuneTCPConn(c)
-			select {
-			case wakeCh <- struct{}{}:
-			default:
-			}
+			// 先入队再唤醒: 主循环醒来时 len(connCh) 必须已经反映这次连接.
 			select {
 			case connCh <- pendingConn{conn: c, accepted: time.Now()}:
+				select {
+				case wakeCh <- struct{}{}:
+				default:
+				}
 			default:
 				_ = c.Close()
 			}
@@ -1140,12 +1185,20 @@ func runConnect(args []string) {
 
 		// 按需连接模式 (-on-demand): 当没有本地 TCP 连接等待时休眠省电, 有连接到达时立即唤醒打洞
 		if cfg.onDemand && len(connCh) == 0 {
-			log.Printf("connect: on-demand mode idle, waiting for local TCP connection on %s...", cfg.listen)
+			// 隧道在线期间到达的连接会留下一个没人消费的 wakeCh 信号,
+			// 先排空它, 避免休眠后立刻假唤醒; 排空后二次确认队列仍为空再阻塞.
 			select {
-			case <-stop:
-				return
 			case <-wakeCh:
-				log.Printf("connect: local TCP connection arrived, waking up tunnel...")
+			default:
+			}
+			if len(connCh) == 0 {
+				log.Printf("connect: on-demand mode idle, waiting for local TCP connection on %s...", cfg.listen)
+				select {
+				case <-stop:
+					return
+				case <-wakeCh:
+					log.Printf("connect: local TCP connection arrived, waking up tunnel...")
+				}
 			}
 		}
 
@@ -1291,16 +1344,12 @@ func (s *tunnelSess) run() error {
 		s.wasReady.Store(true)
 		s.lastActive.Store(time.Now().UnixNano())
 		globalStats.activePeers.Store(1)
-		t := newTransport(dc, func(typ uint8, id uint32, payload []byte) {
-			s.lastActive.Store(time.Now().UnixNano())
-			s.trMu.Lock()
-			cur := s.tr
-			s.trMu.Unlock()
-			if cur != nil {
-				handleFrameConnect(s.reg, cur, typ, id, payload)
+		t := newTransport(dc, func(t *transport) frameHandler {
+			return func(typ uint8, id uint32, payload []byte) {
+				s.lastActive.Store(time.Now().UnixNano())
+				handleFrameConnect(s.reg, t, typ, id, payload)
 			}
-		})
-		t.setOnClose(s.cancelFn)
+		}, s.cancelFn)
 		t.startKeepalive(s.cfg.keepalive)
 		s.trMu.Lock()
 		s.tr = t
@@ -1486,17 +1535,28 @@ func (s *tunnelSess) acceptLoop() {
 	}
 }
 
+func (s *tunnelSess) requeue(item pendingConn) {
+	select {
+	case s.connCh <- item:
+	default:
+		_ = item.conn.Close()
+	}
+}
+
 func (s *tunnelSess) registerConn(item pendingConn) {
 	s.trMu.Lock()
 	tr := s.tr
 	s.trMu.Unlock()
 	if tr == nil {
-		// 隧道刚断, 将尚未读取数据的 TCP 连接放回队列供下一轮重连使用
-		select {
-		case s.connCh <- item:
-		default:
-			_ = item.conn.Close()
-		}
+		// 隧道刚断, 连接放回队列供下一轮重连使用; 立即结束本会话,
+		// 否则 acceptLoop 会从队列里取出同一连接并立即失败, 形成忙等自旋.
+		s.requeue(item)
+		s.cancelFn()
+		return
+	}
+	if s.reg.count() >= maxStreamsPerSession {
+		log.Printf("connect: too many streams (%d), closing local conn", s.reg.count())
+		_ = item.conn.Close()
 		return
 	}
 
@@ -1510,11 +1570,8 @@ func (s *tunnelSess) registerConn(item pendingConn) {
 	if err := tr.send(frameSyn, id, nil); err != nil {
 		log.Printf("connect: SYN failed: %v, re-queueing connection", err)
 		s.reg.remove(id)
-		select {
-		case s.connCh <- item:
-		default:
-			_ = c.Close()
-		}
+		s.requeue(item)
+		s.cancelFn() // 结束本会话, 由下一轮新会话消费队列中的连接
 		return
 	}
 
