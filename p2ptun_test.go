@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -282,15 +283,53 @@ func TestSignalingIDTakenAndReconnect(t *testing.T) {
 	broker := newMockPeerJSServer()
 	defer broker.close()
 
-	sc1, err := dialSignaling(broker.wsURL(), "peerjs", "dup-id", "tok1", nil, nil)
+	sc1, err := dialSignaling(context.Background(), broker.wsURL(), "peerjs", "dup-id", "tok1", nil, nil)
 	if err != nil {
 		t.Fatalf("first dialSignaling failed: %v", err)
 	}
 	defer sc1.shutdown()
 
-	_, err = dialSignaling(broker.wsURL(), "peerjs", "dup-id", "tok2", nil, nil)
+	_, err = dialSignaling(context.Background(), broker.wsURL(), "peerjs", "dup-id", "tok2", nil, nil)
 	if !errors.Is(err, errIDTaken) {
 		t.Fatalf("expected errIDTaken on duplicate ID, got: %v", err)
+	}
+}
+
+// /quit、SIGTERM 或会话结束时必须能立即打断卡住的信令握手（否则 p2ptun stop 会等
+// websocket 15s 超时后强杀，留 stale pidfile）。
+func TestDialSignalingHonorsContextCancel(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	// 只接 TCP、永不回 HTTP 101: 模拟握手卡住的信令服
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				time.Sleep(30 * time.Second)
+				_ = conn.Close()
+			}(c)
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		cancel()
+	}()
+	start := time.Now()
+	_, err = dialSignaling(ctx, "ws://"+ln.Addr().String(), "peerjs", "id-cancel-test", "tok", nil, nil)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected dial error after context cancel, got nil")
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("context cancel did not interrupt handshake promptly: took %v", elapsed)
 	}
 }
 

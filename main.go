@@ -713,7 +713,12 @@ func (m *exposeManager) runSignalingLoop() error {
 	token := randHex(12)
 	sigLost := make(chan error, 1)
 
+	// 信令握手也要响应 stop: 停止服务时不必等 websocket/代理超时.
+	ctx, cancel := contextWithStops(m.stop, nil)
+	defer cancel()
+
 	sc, err := dialSignalingAny(
+		ctx,
 		m.cfg.brokers,
 		m.cfg.key,
 		m.cfg.id,
@@ -1424,7 +1429,11 @@ func (s *tunnelSess) run() error {
 		}()
 	}
 
-	sc, err := dialSignalingAny(s.cfg.brokers, s.cfg.key, s.cfg.id, s.token, func(typ, src string, sig pjSignal) {
+	// /quit、SIGTERM 或会话结束时立即打断正在进行的信令拨号, 避免关机等 6~15s 超时.
+	ctx, cancel := contextWithStops(s.cancel, s.stop)
+	defer cancel()
+
+	sc, err := dialSignalingAny(ctx, s.cfg.brokers, s.cfg.key, s.cfg.id, s.token, func(typ, src string, sig pjSignal) {
 		s.onSignal(typ, src, sig, sdp)
 	}, func(err error) {
 		// 信令断开时: 如果 WebRTC DataChannel 已经建立直连, P2P 数据面无需因信令闪断而自杀!

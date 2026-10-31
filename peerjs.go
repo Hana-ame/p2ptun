@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -104,14 +105,63 @@ func buildPeerJSURL(broker, key, id, token string) string {
 		"&version=1.5.2"
 }
 
+// contextWithStops 返回一个在任一 stop 通道关闭（或外部 cancel）时自动取消的 context。
+// 用于让信令握手 / 拨号这类阻塞操作能在 /quit、SIGTERM、隧道会话结束时立即中止，
+// 而不是干等 websocket/ICE 超时（实测可达 6~15s，会让 p2ptun stop 误判为未退出而强杀）。
+func contextWithStops(stop1, stop2 <-chan struct{}) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		select {
+		case <-stop1:
+		case <-stop2:
+		case <-ctx.Done():
+			return
+		}
+		cancel()
+	}()
+	return ctx, cancel
+}
+
+// dialWebSocketCtx 在 ctx 取消时立即返回（即使底层 websocket 握手/TLS/代理拨号
+// 自身不监听 ctx）。gorilla 的 DialContext 只在 TCP 拨号阶段看 ctx，握手阶段
+// 最长会卡 HandshakeTimeout(15s)；这里并发等待，保证 /quit 能秒退。
+func dialWebSocketCtx(ctx context.Context, d *websocket.Dialer, u string, h http.Header) (*websocket.Conn, *http.Response, error) {
+	type dialResult struct {
+		conn *websocket.Conn
+		resp *http.Response
+		err  error
+	}
+	ch := make(chan dialResult, 1)
+	go func() {
+		conn, resp, err := d.DialContext(ctx, u, h)
+		ch <- dialResult{conn, resp, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.conn, r.resp, r.err
+	case <-ctx.Done():
+		// 底层拨号可能稍后才返回; 拿到连接就关掉, 避免泄漏.
+		go func() {
+			r := <-ch
+			if r.conn != nil {
+				_ = r.conn.Close()
+			}
+		}()
+		return nil, nil, ctx.Err()
+	}
+}
+
 // dialSignalingAny 支持多 broker 列表依次容灾连接, 并在直连失败且存在环境代理时自动尝试代理回退
-func dialSignalingAny(brokers []string, key, id, token string, onSignal func(string, string, pjSignal), onClose func(error)) (*signalingClient, error) {
+func dialSignalingAny(ctx context.Context, brokers []string, key, id, token string, onSignal func(string, string, pjSignal), onClose func(error)) (*signalingClient, error) {
 	if len(brokers) == 0 {
 		brokers = []string{defaultBroker}
 	}
 	var lastErr error
 	for _, b := range brokers {
-		sc, err := dialSignaling(b, key, id, token, onSignal, onClose)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		sc, err := dialSignaling(ctx, b, key, id, token, onSignal, onClose)
 		if err == nil {
 			return sc, nil
 		}
@@ -125,18 +175,19 @@ func dialSignalingAny(brokers []string, key, id, token string, onSignal func(str
 }
 
 // dialSignaling connects to a PeerJS cloud/server WebSocket and waits for OPEN.
-func dialSignaling(broker, key, id, token string, onSignal func(string, string, pjSignal), onClose func(error)) (*signalingClient, error) {
+// ctx 取消（/quit、SIGTERM、会话结束）时立即中断握手，不再阻塞到超时。
+func dialSignaling(ctx context.Context, broker, key, id, token string, onSignal func(string, string, pjSignal), onClose func(error)) (*signalingClient, error) {
 	u := buildPeerJSURL(broker, key, id, token)
 
 	h := http.Header{}
 	h.Set("Origin", "https://peerjs.com")
-	h.Set("User-Agent", "Mozilla/5.0 (p2ptun/" + version + ")")
+	h.Set("User-Agent", "Mozilla/5.0 (p2ptun/"+version+")")
 
-	ws, resp, err := wsDialer().Dial(u, h)
-	if err != nil && configuredProxy == "" && !keepAmbientProxy && ambientProxy != "" {
+	ws, resp, err := dialWebSocketCtx(ctx, wsDialer(), u, h)
+	if err != nil && configuredProxy == "" && !keepAmbientProxy && ambientProxy != "" && ctx.Err() == nil {
 		// 直连信令失败时, 若启动前环境带有代理 (如国内环境需代理连 0.peerjs.com), 自动尝试代理连接信令
 		log.Printf("peerjs: direct dial %s failed (%v), trying fallback proxy %s", broker, err, ambientProxy)
-		ws, resp, err = wsDialerWithProxy(ambientProxy).Dial(u, h)
+		ws, resp, err = dialWebSocketCtx(ctx, wsDialerWithProxy(ambientProxy), u, h)
 	}
 	if err != nil {
 		if resp != nil {
@@ -155,6 +206,17 @@ func dialSignaling(broker, key, id, token string, onSignal func(string, string, 
 		onClose:  onClose,
 		done:     make(chan struct{}),
 	}
+
+	// 握手等待 OPEN 期间也要能被 ctx 打断, 否则 /quit 会卡到 15s read deadline.
+	stopWatch := make(chan struct{})
+	defer close(stopWatch)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = ws.Close()
+		case <-stopWatch:
+		}
+	}()
 
 	// Wait for OPEN / ERROR / ID-TAKEN before returning.
 	_ = ws.SetReadDeadline(time.Now().Add(15 * time.Second))
