@@ -1,9 +1,14 @@
-# p2ptun (v0.2.0)
+# p2ptun (v0.2.1)
 
 P2P TCP tunnel for remote SSH and TCP services, built on **PeerJS signaling + WebRTC DataChannel**.
 
 - **Signaling**: PeerJS cloud (`wss://0.peerjs.com,wss://1.peerjs.com`) or self-hosted PeerJS server — exchanges SDP/ICE only.
 - **Data plane**: WebRTC DataChannel, pure P2P (ICE + STUN) by default, with optional TURN relay support (`-turn`) for strict symmetric NAT / UDP-blocked networks.
+- **Security & Stability Hardening (`v0.2.1`)**:
+  - 配对密钥不再进入日志与进程列表（`-daemon` 子进程改由 `P2PTUN_SECRET` 传递）；`~/.p2ptun` 目录 0700、日志/pidfile 0600。
+  - `/reconnect`、`/quit` 仅接受 POST + 同源校验（防 CSRF）；新增 `/quit` 优雅退出（Windows 无信号可用）。
+  - `p2ptun stop` 校验 pidfile 中 PID 确为 p2ptun（防 PID 复用误杀），优先 `/quit`/SIGINT 并轮询最多 3s 才硬杀。
+  - 单会话并发流上限 256 + 拨号可取消（防 frameSyn 洪泛耗尽 FD）；修复会话关闭死锁、背压阻塞控制帧、唤醒饥饿、首帧竞态、on-demand 假唤醒等并发问题。
 - **Daemon & Multi-Session Ready (`v0.2.0`)**:
   - **常驻守护 (Daemonization)**: Built-in `-daemon` (`-d`), rotating logs (`-logfile`), PID management (`p2ptun status` / `p2ptun stop`), HTTP health endpoint (`-status-addr`), systemd & Termux boot generators (`p2ptun service`).
   - **多次连接 (Multi-Session & Instant Reconnect)**: Persistent signaling on `expose` decoupled from WebRTC sessions; supports concurrent multi-client connections (`-max-peers 16`) and zero-stall instant reconnection when clients restart or switch networks.
