@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -120,14 +121,25 @@ type rotatingFileWriter struct {
 	size    int64
 }
 
+// openLogFile 以私有权限 (0600) 打开日志文件; 目录不存在时按 0700 创建.
+// 对历史版本留下的 0644 日志/目录再收紧一次, 避免同机其他用户读到日志内容.
+func openLogFile(path string, flag int) (*os.File, error) {
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		_ = os.MkdirAll(dir, 0700)
+	}
+	f, err := os.OpenFile(path, flag, 0600)
+	if err != nil {
+		return nil, err
+	}
+	_ = f.Chmod(0600)
+	return f, nil
+}
+
 func newRotatingFileWriter(path string, maxMB int) (*rotatingFileWriter, error) {
 	if maxMB <= 0 {
 		maxMB = 10
 	}
-	if dir := filepath.Dir(path); dir != "" && dir != "." {
-		_ = os.MkdirAll(dir, 0755)
-	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	f, err := openLogFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND)
 	if err != nil {
 		return nil, err
 	}
@@ -154,7 +166,8 @@ func (w *rotatingFileWriter) Write(p []byte) (int, error) {
 		backup := w.path + ".1"
 		_ = os.Remove(backup)
 		_ = os.Rename(w.path, backup)
-		f, err := os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		_ = os.Chmod(backup, 0600) // 轮转出来的旧日志同样收紧
+		f, err := openLogFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC)
 		if err != nil {
 			return 0, err
 		}
@@ -182,11 +195,46 @@ func defaultDaemonPaths(mode string) (pidFile, logFile string) {
 	baseDir := os.TempDir()
 	if home, err := os.UserHomeDir(); err == nil && home != "" {
 		cand := filepath.Join(home, ".p2ptun")
-		if err := os.MkdirAll(cand, 0755); err == nil {
+		if err := os.MkdirAll(cand, 0700); err == nil {
+			_ = os.Chmod(cand, 0700) // 收紧旧版本创建的 0755 目录
 			baseDir = cand
 		}
 	}
 	return filepath.Join(baseDir, "p2ptun-"+mode+".pid"), filepath.Join(baseDir, "p2ptun-"+mode+".log")
+}
+
+// scrubSecretArgs 从转发给后台子进程的 argv 中移除 -secret 及其值,
+// 密钥改由 P2PTUN_SECRET 环境变量传递. 否则常驻守护进程的命令行
+// (ps / /proc/<pid>/cmdline) 会长期明文泄露配对密钥.
+func scrubSecretArgs(args []string) []string {
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "-secret" || arg == "--secret":
+			if i+1 < len(args) {
+				i++ // 跳过密钥值
+			}
+		case strings.HasPrefix(arg, "-secret=") || strings.HasPrefix(arg, "--secret="):
+			// 整条丢弃
+		default:
+			out = append(out, arg)
+		}
+	}
+	return out
+}
+
+// daemonChildEnv 构造后台子进程环境: 去掉旧的 P2PTUN_SECRET/_P2PTUN_DAEMON_CHILD,
+// 用当前实际生效的密钥重新注入, 保证子进程脱离 argv 后仍能拿到配对密钥.
+func daemonChildEnv(secret string) []string {
+	env := make([]string, 0, len(os.Environ())+2)
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, "P2PTUN_SECRET=") || strings.HasPrefix(kv, "_P2PTUN_DAEMON_CHILD=") {
+			continue
+		}
+		env = append(env, kv)
+	}
+	return append(env, "_P2PTUN_DAEMON_CHILD=1", "P2PTUN_SECRET="+secret)
 }
 
 // maybeDaemonize 若开启 -daemon 且尚未处于后台子进程中, 启动后台守护进程并退出父进程
@@ -206,23 +254,22 @@ func maybeDaemonize(cfg *config) (*rotatingFileWriter, func(), error) {
 		if err != nil {
 			exe = os.Args[0]
 		}
-		cmd := exec.Command(exe, os.Args[1:]...)
-		cmd.Env = append(os.Environ(), "_P2PTUN_DAEMON_CHILD=1")
-		if cfg.logFile != "" {
-			if dir := filepath.Dir(cfg.logFile); dir != "" && dir != "." {
-				_ = os.MkdirAll(dir, 0755)
-			}
-			f, err := os.OpenFile(cfg.logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-			if err != nil {
-				return nil, nil, fmt.Errorf("open logfile %s: %w", cfg.logFile, err)
-			}
-			cmd.Stdout = f
-			cmd.Stderr = f
-			defer f.Close()
+		cmd := exec.Command(exe, scrubSecretArgs(os.Args[1:])...)
+		cmd.Env = daemonChildEnv(cfg.secret)
+		// 子进程自己会用 rotatingFileWriter 打开日志并轮转; 这里不能再把
+		// 同一个文件的句柄交给它的 stdout/stderr, 否则轮转 rename 后
+		// stderr 仍指向旧 inode (Windows 上还会因共享冲突导致 rename 失败).
+		devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+		if err != nil {
+			return nil, nil, fmt.Errorf("open %s: %w", os.DevNull, err)
 		}
+		cmd.Stdout = devNull
+		cmd.Stderr = devNull
 		if err := cmd.Start(); err != nil {
+			_ = devNull.Close()
 			return nil, nil, fmt.Errorf("start background daemon: %w", err)
 		}
+		_ = devNull.Close()
 		fmt.Printf("p2ptun %s daemon started (pid=%d, pidfile=%s, logfile=%s)\n",
 			cfg.mode, cmd.Process.Pid, cfg.pidFile, cfg.logFile)
 		os.Exit(0)
@@ -244,9 +291,9 @@ func maybeDaemonize(cfg *config) (*rotatingFileWriter, func(), error) {
 
 	if cfg.pidFile != "" {
 		if dir := filepath.Dir(cfg.pidFile); dir != "" && dir != "." {
-			_ = os.MkdirAll(dir, 0755)
+			_ = os.MkdirAll(dir, 0700)
 		}
-		_ = os.WriteFile(cfg.pidFile, []byte(strconv.Itoa(os.Getpid())+"\n"), 0644)
+		_ = os.WriteFile(cfg.pidFile, []byte(strconv.Itoa(os.Getpid())+"\n"), 0600)
 	}
 
 	cleanup := func() {
@@ -260,8 +307,22 @@ func maybeDaemonize(cfg *config) (*rotatingFileWriter, func(), error) {
 	return logWriter, cleanup, nil
 }
 
+// crossSiteRequest 判断请求是否来自浏览器跨站页面 (CSRF 防护)。
+func crossSiteRequest(r *http.Request) bool {
+	if origin := r.Header.Get("Origin"); origin != "" {
+		u, err := url.Parse(origin)
+		if err != nil || !strings.EqualFold(u.Host, r.Host) {
+			return true
+		}
+	}
+	if site := r.Header.Get("Sec-Fetch-Site"); site != "" && site != "same-origin" && site != "none" {
+		return true
+	}
+	return false
+}
+
 // startStatusServer 启动可选的本地 HTTP 状态与控制接口 (-status-addr 127.0.0.1:9222)
-func startStatusServer(addr string, stop <-chan struct{}) (net.Listener, error) {
+func startStatusServer(addr string, stop <-chan struct{}, quit func()) (net.Listener, error) {
 	if addr == "" {
 		return nil, nil
 	}
@@ -287,9 +348,39 @@ func startStatusServer(addr string, stop <-chan struct{}) (net.Listener, error) 
 		_ = enc.Encode(globalStats.snapshot())
 	})
 	mux.HandleFunc("/reconnect", func(w http.ResponseWriter, r *http.Request) {
+		// 状态接口是本地控制面: 只接受 POST, 且拒绝浏览器跨站请求.
+		// 否则任意网页可用 <img src="http://127.0.0.1:9222/reconnect">
+		// (或自动提交表单) 持续触发断线重连, 构成 CSRF DoS.
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if crossSiteRequest(r) {
+			http.Error(w, "cross-site request rejected", http.StatusForbidden)
+			return
+		}
 		globalStats.triggerReconnect()
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"ok":true,"action":"reconnect_triggered"}` + "\n"))
+	})
+	mux.HandleFunc("/quit", func(w http.ResponseWriter, r *http.Request) {
+		// 优雅停止端点: Windows 不支持给非子进程发信号, `p2ptun stop`
+		// 需要靠它触发 SIGTERM 等价的退出流程 (SIGTERM 父进程仍可用 kill).
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if crossSiteRequest(r) {
+			http.Error(w, "cross-site request rejected", http.StatusForbidden)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"action":"quit"}` + "\n"))
+		if quit != nil {
+			go quit()
+		}
 	})
 
 	srv := &http.Server{
@@ -349,6 +440,10 @@ func runStatusCmd(args []string) {
 		if err != nil {
 			continue
 		}
+		if !isP2ptunProcess(pid, m) {
+			fmt.Printf("p2ptun (%s): no active daemon (stale pidfile %s)\n", m, pf)
+			return
+		}
 		fmt.Printf("p2ptun (%s): pid=%d (pidfile=%s)\n", m, pid, pf)
 		if lf != "" {
 			if logBytes, err := os.ReadFile(lf); err == nil {
@@ -373,38 +468,83 @@ func runStopCmd(args []string) {
 	fs := flag.NewFlagSet("stop", flag.ExitOnError)
 	mode := fs.String("mode", "", "mode to stop (expose or connect)")
 	pidFile := fs.String("pidfile", envOr("P2PTUN_PIDFILE", ""), "path to pidfile")
+	statusAddr := fs.String("status-addr", envOr("P2PTUN_STATUS_ADDR", ""), "optional status server address for graceful /quit")
 	_ = fs.Parse(args)
 
-	var candidates []string
+	type stopTarget struct {
+		pf   string
+		mode string
+	}
+	var targets []stopTarget
 	if *pidFile != "" {
-		candidates = append(candidates, *pidFile)
+		targets = append(targets, stopTarget{*pidFile, *mode})
 	} else if *mode != "" {
 		pf, _ := defaultDaemonPaths(*mode)
-		candidates = append(candidates, pf)
+		targets = append(targets, stopTarget{pf, *mode})
 	} else {
 		pf1, _ := defaultDaemonPaths("expose")
 		pf2, _ := defaultDaemonPaths("connect")
-		candidates = append(candidates, pf1, pf2)
+		targets = append(targets, stopTarget{pf1, "expose"}, stopTarget{pf2, "connect"})
 	}
 
 	stoppedAny := false
-	for _, pf := range candidates {
-		data, err := os.ReadFile(pf)
+	for _, tgt := range targets {
+		data, err := os.ReadFile(tgt.pf)
 		if err != nil {
 			continue
 		}
 		pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
 		if err != nil {
+			_ = os.Remove(tgt.pf)
 			continue
 		}
-		if proc, err := os.FindProcess(pid); err == nil {
-			_ = proc.Signal(os.Interrupt)
-			time.Sleep(300 * time.Millisecond)
-			_ = proc.Kill()
-			_ = os.Remove(pf)
-			fmt.Printf("p2ptun: stopped pid=%d (%s)\n", pid, pf)
-			stoppedAny = true
+		if !isP2ptunProcess(pid, tgt.mode) {
+			// pidfile 是旧的/被别的进程复用了: 只清理文件, 绝不向该 PID 发信号.
+			fmt.Printf("p2ptun: refusing to stop pid=%d (%s): not a p2ptun process (stale pidfile)\n", pid, tgt.pf)
+			_ = os.Remove(tgt.pf)
+			continue
 		}
+		// 1) 优先走 status server 的 /quit (跨平台, Windows 上 os.Interrupt 不可用).
+		graceful := false
+		if *statusAddr != "" {
+			base := *statusAddr
+			if !strings.HasPrefix(base, "http://") && !strings.HasPrefix(base, "https://") {
+				base = "http://" + base
+			}
+			req, rerr := http.NewRequest(http.MethodPost, strings.TrimRight(base, "/")+"/quit", nil)
+			if rerr == nil {
+				if resp, derr := (&http.Client{Timeout: 2 * time.Second}).Do(req); derr == nil {
+					_ = resp.Body.Close()
+					graceful = resp.StatusCode == http.StatusOK
+				}
+			}
+		}
+		// 2) Unix 上直接发 SIGINT (p2ptun 自己处理); Windows 上该调用会失败, 忽略.
+		if !graceful {
+			if proc, perr := os.FindProcess(pid); perr == nil {
+				_ = proc.Signal(os.Interrupt)
+			}
+		}
+		// 3) 轮询 pidfile: 进程优雅退出时 cleanup 会删除 pidfile; 最多等 3s.
+		exited := false
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, statErr := os.Stat(tgt.pf); statErr != nil {
+				exited = true
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		if !exited {
+			// 4) 超时才硬杀, 避免像旧版那样 300ms 就 SIGKILL 导致 LEAVE 发不出去.
+			if proc, perr := os.FindProcess(pid); perr == nil {
+				_ = proc.Kill()
+			}
+			time.Sleep(300 * time.Millisecond)
+		}
+		_ = os.Remove(tgt.pf)
+		fmt.Printf("p2ptun: stopped pid=%d (%s)\n", pid, tgt.pf)
+		stoppedAny = true
 	}
 	if !stoppedAny {
 		fmt.Println("p2ptun: no active daemon found to stop")

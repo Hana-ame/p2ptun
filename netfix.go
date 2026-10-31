@@ -39,8 +39,8 @@ var dnsServers = []string{
 }
 
 var (
-	ambientProxy   string // 启动前环境中存在的代理 URL (用于直连信令失败时可选回退)
-	configuredProxy string
+	ambientProxy     string // 启动前环境中存在的代理 URL (用于直连信令失败时可选回退)
+	configuredProxy  string
 	keepAmbientProxy bool
 
 	dnsMu          sync.RWMutex
@@ -370,11 +370,32 @@ func clearProxyEnv() {
 	}
 }
 
+// firstDNSProbeDone 在首次真实 DNS 探测完成后关闭, 供首次拨号前短暂等待。
+var (
+	firstDNSProbeDone     = make(chan struct{})
+	firstDNSProbeDoneOnce sync.Once
+)
+
+// waitFirstDNSProbe 最多等待 max 让首次 DNS 探测完成: UDP 53 被封锁的网络
+// 依赖探测把 preferTCPDNS 打开, 若在探测完成前就拨号, 首次连接会白失败一次。
+func waitFirstDNSProbe(max time.Duration) {
+	if max <= 0 {
+		return
+	}
+	select {
+	case <-firstDNSProbeDone:
+	case <-time.After(max):
+	}
+}
+
 // applyNetFix 全局固定解析器, 覆盖 net.Dialer / pion(ICE/STUN 域名解析), 并异步探测最优 DNS。
 func applyNetFix() {
 	clearProxyEnv()
 	net.DefaultResolver = netResolver()
-	go probeDNSServers(1500 * time.Millisecond)
+	go func() {
+		probeDNSServers(1500 * time.Millisecond)
+		firstDNSProbeDoneOnce.Do(func() { close(firstDNSProbeDone) })
+	}()
 }
 
 // wsDialerWithProxy 返回带固定 DNS + Termux CA + 可选代理的 gorilla websocket dialer。

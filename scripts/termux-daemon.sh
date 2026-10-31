@@ -17,8 +17,11 @@ LOG_FILE="${STATE_DIR}/p2ptun-${MODE}.log"
 
 mkdir -p "${STATE_DIR}"
 if [ -f "${ENV_FILE}" ]; then
+    # set -a: 让 config.env 里不带 export 前缀的变量也导出给 p2ptun 子进程
+    set -a
     # shellcheck disable=SC1090
     source "${ENV_FILE}"
+    set +a
 fi
 
 BIN="$(command -v p2ptun || true)"
@@ -86,7 +89,7 @@ case "${cmd}" in
         cat > "${BOOT_SCRIPT}" <<EOF
 #!/data/data/com.termux/files/usr/bin/sh
 termux-wake-lock
-[ -f "${ENV_FILE}" ] && . "${ENV_FILE}"
+if [ -f "${ENV_FILE}" ]; then set -a; . "${ENV_FILE}"; set +a; fi
 exec "${BIN:-p2ptun}" ${MODE} -daemon -pidfile "${PID_FILE}" -logfile "${LOG_FILE}" -status-addr "${STATUS_ADDR}"
 EOF
         chmod +x "${BOOT_SCRIPT}"

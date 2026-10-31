@@ -26,6 +26,9 @@ const (
 	dcSendTimeout     = 60 * time.Second
 	streamEnqueueWait = 15 * time.Second
 	maxChunkSize      = 32 << 10
+	// maxStreamsPerSession caps concurrent streams per tunnel session so a peer
+	// cannot exhaust file descriptors by flooding frameSyn (each pending dial holds one FD).
+	maxStreamsPerSession = 256
 )
 
 type frameHandler func(typ uint8, id uint32, payload []byte)
@@ -50,12 +53,17 @@ type transport struct {
 	bytesRx     atomic.Uint64
 }
 
-func newTransport(dc *webrtc.DataChannel, onFrame frameHandler) *transport {
+// newTransport builds the transport and wires DataChannel callbacks.
+//
+// makeHandler is called with the transport instance BEFORE dc.OnMessage is
+// registered, so the frame handler never has to look the transport up through
+// session state (which is assigned only after newTransport returns). This fixes
+// the OnOpen/first-frame race where the first frameSyn could be dropped.
+func newTransport(dc *webrtc.DataChannel, makeHandler func(t *transport) frameHandler, onClose func()) *transport {
 	t := &transport{
-		dc:      dc,
-		lowCh:   make(chan struct{}, 1),
-		onFrame: onFrame,
-		done:    make(chan struct{}),
+		dc:    dc,
+		lowCh: make(chan struct{}, 1),
+		done:  make(chan struct{}),
 	}
 	t.lastRecvNs.Store(time.Now().UnixNano())
 	dc.SetBufferedAmountLowThreshold(dcLowWater)
@@ -65,6 +73,10 @@ func newTransport(dc *webrtc.DataChannel, onFrame frameHandler) *transport {
 		default:
 		}
 	})
+	if makeHandler != nil {
+		t.onFrame = makeHandler(t)
+	}
+	t.onClose = onClose
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
 		t.dispatch(msg.Data)
 	})
@@ -173,20 +185,35 @@ func (t *transport) send(typ uint8, id uint32, payload []byte) error {
 	binary.BigEndian.PutUint32(frame[5:9], uint32(len(payload)))
 	copy(frame[9:], payload)
 
-	for t.dc.BufferedAmount() > dcHighWater {
-		t.mu.Unlock()
-		select {
-		case <-t.lowCh:
-		case <-t.done:
-			return fmt.Errorf("transport closed while waiting backpressure")
-		case <-time.After(dcSendTimeout):
-			t.close()
-			return fmt.Errorf("datachannel stuck, buffered=%d", t.dc.BufferedAmount())
-		}
-		t.mu.Lock()
-		if t.closed {
+	// Only DATA frames participate in flow control: control frames (PING/PONG/
+	// FIN/RST) are tiny and are sent from the DataChannel OnMessage goroutine.
+	// Blocking that goroutine on backpressure would deadlock the whole receive
+	// path (we could never drain the buffer that unblocks us).
+	if typ == frameData {
+		for t.dc.BufferedAmount() > dcHighWater {
 			t.mu.Unlock()
-			return fmt.Errorf("transport closed")
+			select {
+			case <-t.lowCh:
+				// Cascade wakeup: lowCh holds one token but OnBufferedAmountLow is
+				// edge-triggered. Re-post the token while we are still below the
+				// high-water mark so the other waiting streams are released too.
+				if t.dc.BufferedAmount() <= dcHighWater {
+					select {
+					case t.lowCh <- struct{}{}:
+					default:
+					}
+				}
+			case <-t.done:
+				return fmt.Errorf("transport closed while waiting backpressure")
+			case <-time.After(dcSendTimeout):
+				t.close()
+				return fmt.Errorf("datachannel stuck, buffered=%d", t.dc.BufferedAmount())
+			}
+			t.mu.Lock()
+			if t.closed {
+				t.mu.Unlock()
+				return fmt.Errorf("transport closed")
+			}
 		}
 	}
 	err := t.dc.Send(frame)
@@ -198,7 +225,15 @@ func (t *transport) send(typ uint8, id uint32, payload []byte) error {
 	return err
 }
 
-func (t *transport) close() {
+func (t *transport) close() { t.closeInner(true) }
+
+// closeNoNotify closes the transport without invoking the onClose callback.
+// Use it from a caller that is itself the onClose target (e.g. exposeSession.close,
+// which is registered via setOnClose): calling close() there would re-enter
+// sync.Once.Do on the same Once and deadlock.
+func (t *transport) closeNoNotify() { t.closeInner(false) }
+
+func (t *transport) closeInner(notify bool) {
 	t.mu.Lock()
 	if t.closed {
 		t.mu.Unlock()
@@ -209,7 +244,7 @@ func (t *transport) close() {
 	fn := t.onClose
 	t.mu.Unlock()
 	_ = t.dc.Close()
-	if fn != nil {
+	if notify && fn != nil {
 		t.closeOnce.Do(fn)
 	}
 }
@@ -218,11 +253,11 @@ func (t *transport) close() {
 
 // stream bridges one TCP connection over the tunnel.
 // 修复了原版的 4 个并发与协议漏洞:
-//   1. dcToConn 之前未监听 <-st.stopped, 导致会话中断或异常关闭时 goroutine 永久泄漏;
-//   2. expose 侧异步 DialTimeout 期间若收到 FIN 或 stop, 之前未原子检查直接覆盖 st.conn 导致连接泄漏;
-//   3. 单个慢速流 ch 满时会阻塞整个 DataChannel OnMessage 回调, 现增加安全入队超时保护;
-//   4. 收到对端 FIN 排空队列后, 若直接 conn.Close() 会把己方正在读取响应的 connToDC 一并掐断!
-//      现优先调用 TCPConn.CloseWrite() 执行真正的 TCP 半关闭 (SHUT_WR), 待双向读写都结束后再完全关闭 socket。
+//  1. dcToConn 之前未监听 <-st.stopped, 导致会话中断或异常关闭时 goroutine 永久泄漏;
+//  2. expose 侧异步 DialTimeout 期间若收到 FIN 或 stop, 之前未原子检查直接覆盖 st.conn 导致连接泄漏;
+//  3. 单个慢速流 ch 满时会阻塞整个 DataChannel OnMessage 回调, 现增加安全入队超时保护;
+//  4. 收到对端 FIN 排空队列后, 若直接 conn.Close() 会把己方正在读取响应的 connToDC 一并掐断!
+//     现优先调用 TCPConn.CloseWrite() 执行真正的 TCP 半关闭 (SHUT_WR), 待双向读写都结束后再完全关闭 socket。
 type stream struct {
 	id          uint32
 	connMu      sync.Mutex
@@ -413,10 +448,12 @@ func (r *streamReg) allocID() uint32 {
 
 func (r *streamReg) add(s *stream) {
 	r.mu.Lock()
+	_, existed := r.streams[s.id]
 	r.streams[s.id] = s
-	n := len(r.streams)
 	r.mu.Unlock()
-	globalStats.activeStreams.Store(int64(n))
+	if !existed {
+		globalStats.activeStreams.Add(1)
+	}
 }
 
 func (r *streamReg) get(id uint32) *stream {
@@ -428,10 +465,12 @@ func (r *streamReg) get(id uint32) *stream {
 func (r *streamReg) remove(id uint32) *stream {
 	r.mu.Lock()
 	s := r.streams[id]
+	_, existed := r.streams[id]
 	delete(r.streams, id)
-	n := len(r.streams)
 	r.mu.Unlock()
-	globalStats.activeStreams.Store(int64(n))
+	if existed {
+		globalStats.activeStreams.Add(-1)
+	}
 	return s
 }
 
@@ -449,7 +488,9 @@ func (r *streamReg) closeAll() {
 	}
 	r.streams = map[uint32]*stream{}
 	r.mu.Unlock()
-	globalStats.activeStreams.Store(0)
+	if len(all) > 0 {
+		globalStats.activeStreams.Add(-int64(len(all)))
+	}
 	for _, s := range all {
 		s.stop()
 	}
