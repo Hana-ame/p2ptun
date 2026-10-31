@@ -55,10 +55,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          body="$(git tag --list "${{ github.ref_name }}" --format='%(contents:body)')"
-          [ -n "$body" ] || body="p2ptun ${{ github.ref_name }}"
+          # 用 annotated tag 的消息作为 release notes.
+          # 注意: actions/checkout 在 tag 事件下可能把远端 tag 落成本地 lightweight tag,
+          # 此时 git for-each-ref '%(contents:body)' 会错误地取到 commit message;
+          # --notes-from-tag 由 gh 直接读取远端 annotated tag, 不受本地 tag 形态影响.
           gh release create "${{ github.ref_name }}" --repo "${{ github.repository }}" \
-            --title "${{ github.ref_name }}" --notes "$body"
+            --title "${{ github.ref_name }}" --notes-from-tag
 
       - name: Upload assets
         env:
