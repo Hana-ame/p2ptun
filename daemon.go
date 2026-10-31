@@ -321,7 +321,8 @@ func crossSiteRequest(r *http.Request) bool {
 	return false
 }
 
-// startStatusServer 启动可选的本地 HTTP 状态与控制接口 (-status-addr 127.0.0.1:9222)
+// startStatusServer 启动可选的本地 HTTP 状态与控制接口 (-status-addr 127.0.0.1:18222)
+// 端口无默认值 (空=不监听); 示例避开 9222/9223 (Chromium CDP) 与 9229 (Node inspector).
 func startStatusServer(addr string, stop <-chan struct{}, quit func()) (net.Listener, error) {
 	if addr == "" {
 		return nil, nil
@@ -349,7 +350,7 @@ func startStatusServer(addr string, stop <-chan struct{}, quit func()) (net.List
 	})
 	mux.HandleFunc("/reconnect", func(w http.ResponseWriter, r *http.Request) {
 		// 状态接口是本地控制面: 只接受 POST, 且拒绝浏览器跨站请求.
-		// 否则任意网页可用 <img src="http://127.0.0.1:9222/reconnect">
+		// 否则任意网页可用 <img src="http://127.0.0.1:18222/reconnect">
 		// (或自动提交表单) 持续触发断线重连, 构成 CSRF DoS.
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", http.MethodPost)

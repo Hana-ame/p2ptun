@@ -64,7 +64,7 @@ p2ptun stop
 | `-pidfile` | `P2PTUN_PIDFILE` | Custom PID file path |
 | `-logfile` | `P2PTUN_LOGFILE` | Custom rotating log file path |
 | `-log-max-mb` | `P2PTUN_LOG_MAX_MB` | Max log size in MB before rotation (default `10`) |
-| `-status-addr` | `P2PTUN_STATUS_ADDR` | Local HTTP status & healthcheck endpoint (e.g. `127.0.0.1:9222`) |
+| `-status-addr` | `P2PTUN_STATUS_ADDR` | Local HTTP status & healthcheck endpoint (e.g. `127.0.0.1:18222`). 无默认值，不指定则不监听；**避开 9222/9223（Chromium/Edge CDP 默认端口）与 9229（Node inspector）** |
 | — | `P2PTUN_DNS` | Custom DNS servers CSV (default auto-probes `/etc/resolv.conf` + `223.5.5.5,119.29.29.29,114.114.114.114,8.8.8.8,1.1.1.1`) |
 
 ## Daemon & Service Setup

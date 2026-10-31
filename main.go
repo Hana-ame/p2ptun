@@ -70,7 +70,7 @@ connect  (run on the remote client side, e.g. Termux / laptop):
   p2ptun connect -peer REMOTE_ID -secret SECRET [-listen 127.0.0.1:2222] [-daemon]
 
 daemon & management commands:
-  p2ptun status  [-mode expose|connect] [-status-addr 127.0.0.1:9222]
+  p2ptun status  [-mode expose|connect] [-status-addr 127.0.0.1:18222]
   p2ptun stop    [-mode expose|connect] [-pidfile PATH]
   p2ptun service [systemd|termux] [expose|connect]
 

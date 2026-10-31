@@ -7,15 +7,22 @@
 ### Termux 手机端常驻
 ```bash
 # 启动后台守护进程 (自动写入 ~/.p2ptun/p2ptun-connect.log 并轮转)
-P2PTUN_PEER=wslssh-a1b2 P2PTUN_SECRET=hunter2 p2ptun connect -daemon -status-addr 127.0.0.1:9222
+P2PTUN_PEER=wslssh-a1b2 P2PTUN_SECRET=hunter2 p2ptun connect -daemon -status-addr 127.0.0.1:18222
 termux-wake-lock
 
 # 查看运行状态与实时 RTT
-p2ptun status -status-addr 127.0.0.1:9222
+p2ptun status -status-addr 127.0.0.1:18222
 
 # 优雅停止 (会自动向信令服发送 LEAVE 释放 ID)
 p2ptun stop
 ```
+
+> **端口选择**：`-status-addr` 没有默认值，不指定就不监听。示例用 `18222` 而不是
+> `9222`：`9222/9223` 是 Chromium/Edge 的 CDP 远程调试默认端口（kuuki-mouse/CUA 栈里
+> Edge `--remote-debugging-port=9222`、`CUA_DRIVER_CDP_PORT=9222` 就是它），同机同端口
+> 会导致后启动的一方 bind 失败：p2ptun 只告警不退出（status/stop 不可用），若 p2ptun
+> 先占住则浏览器 CDP 起不来。`9229` 同理是 Node inspector。脚本默认已避开这些端口，
+> 仍可用 `-status-addr` / `P2PTUN_STATUS_ADDR` 覆盖。
 
 或者使用仓库自带的 `scripts/termux-daemon.sh`：
 ```bash

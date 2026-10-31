@@ -37,7 +37,7 @@ if [ "${MODE}" = "expose" ]; then
 P2PTUN_ID=${ARG1}
 P2PTUN_SECRET=${SECRET}
 P2PTUN_TARGET=${TARGET}
-P2PTUN_STATUS_ADDR=127.0.0.1:9221
+P2PTUN_STATUS_ADDR=127.0.0.1:18223
 EOF
     chmod 0600 "${ENV_PATH}"
     /usr/local/bin/p2ptun service systemd expose > "/etc/systemd/system/${SVC_NAME}.service"
@@ -49,7 +49,7 @@ elif [ "${MODE}" = "connect" ]; then
 P2PTUN_PEER=${ARG1}
 P2PTUN_SECRET=${SECRET}
 P2PTUN_LISTEN=${LISTEN}
-P2PTUN_STATUS_ADDR=127.0.0.1:9222
+P2PTUN_STATUS_ADDR=127.0.0.1:18222
 EOF
     chmod 0600 "${ENV_PATH}"
     /usr/local/bin/p2ptun service systemd connect > "/etc/systemd/system/${SVC_NAME}.service"
