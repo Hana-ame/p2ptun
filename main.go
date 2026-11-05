@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"flag"
@@ -13,11 +14,13 @@ import (
 	"sync/atomic"
 	"time"
 
+	hyClient "github.com/apernet/hysteria/core/v2/client"
 	"github.com/pion/webrtc/v4"
+	quic "github.com/quic-go/quic-go"
 )
 
 const (
-	version = "0.1.6"
+	version = "0.1.7"
 
 	defaultBroker = "wss://0.peerjs.com"
 	defaultKey    = "peerjs"
@@ -54,41 +57,45 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `p2ptun - P2P TCP tunnel over PeerJS cloud signaling + WebRTC DataChannel
-(no relay: PeerJS cloud only exchanges SDP/ICE; payload is P2P)
+	fmt.Fprintf(os.Stderr, `p2ptun - P2P TCP tunnel over PeerJS scheduling + Native UDP (QUIC / Hysteria 2)
+(PeerJS SCTP DataChannel acts as scheduler only; data flows over raw native UDP)
 
 expose   (run where the TCP service lives, e.g. WSL):
-  p2ptun expose -secret SECRET [-id MYID] [-target 127.0.0.1:22] [-stun csv]
+  p2ptun expose -secret SECRET [-id MYID] [-target 127.0.0.1:22] [-proto hy2|quic] [-bandwidth 50]
 
-connect  (run on the remote side, e.g. Termux):
-  p2ptun connect -peer REMOTE_ID -secret SECRET [-listen 127.0.0.1:2222] [-stun csv]
+connect  (run on the remote side, e.g. Termux / Windows):
+  p2ptun connect -peer REMOTE_ID -secret SECRET [-listen 127.0.0.1:2222] [-proto hy2|quic] [-bandwidth 50]
 
 common flags (env fallbacks in parens):
-  -id ID      peer id on signalling server          (P2PTUN_ID)
-  -secret S   pairing secret, must match both sides (P2PTUN_SECRET)
-  -target H   exposed TCP endpoint (expose)         (P2PTUN_TARGET)
-  -listen H   local listen addr (connect)           (P2PTUN_LISTEN)
-  -broker URL signalling server                     (P2PTUN_BROKER=%s)
-  -key K      PeerJS api key                        (P2PTUN_KEY=peerjs)
-  -stun csv   STUN servers, comma separated         (P2PTUN_STUN)
+  -id ID         peer id on signalling server          (P2PTUN_ID)
+  -secret S      pairing secret, must match both sides (P2PTUN_SECRET)
+  -target H      exposed TCP endpoint (expose)         (P2PTUN_TARGET)
+  -listen H      local listen addr (connect)           (P2PTUN_LISTEN)
+  -proto P       transport protocol: hy2, quic, classic(P2PTUN_PROTO=hy2)
+  -bandwidth MB  Brutal CC target bandwidth in Mbps    (P2PTUN_BANDWIDTH=50)
+  -broker URL    signalling server                     (P2PTUN_BROKER=%s)
+  -key K         PeerJS api key                        (P2PTUN_KEY=peerjs)
+  -stun csv      STUN servers, comma separated         (P2PTUN_STUN)
 
 example:
-  expose  : p2ptun expose -id wslssh-a1b2 -secret hunter2 -target 127.0.0.1:22
-  connect : p2ptun connect -peer wslssh-a1b2 -secret hunter2 -listen 127.0.0.1:2222
+  expose  : p2ptun expose -id wslssh-a1b2 -secret hunter2 -target 127.0.0.1:22 -proto hy2 -bandwidth 100
+  connect : p2ptun connect -peer wslssh-a1b2 -secret hunter2 -listen 127.0.0.1:2222 -proto hy2 -bandwidth 100
   then    : ssh -p 2222 user@127.0.0.1
 `, defaultBroker)
 }
 
 type config struct {
-	mode   string
-	id     string
-	peer   string
-	secret string
-	target string
-	listen string
-	broker string
-	key    string
-	stun   []string
+	mode          string
+	id            string
+	peer          string
+	secret        string
+	target        string
+	listen        string
+	broker        string
+	key           string
+	stun          []string
+	proto         string
+	bandwidthMbps int
 }
 
 func envOr(key, def string) string {
@@ -98,18 +105,30 @@ func envOr(key, def string) string {
 	return def
 }
 
+func envInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		var n int
+		if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
+}
+
 func parseConfig(args []string, mode string) (config, error) {
 	fs := flag.NewFlagSet(mode, flag.ContinueOnError)
 	cfg := config{
-		mode:   mode,
-		id:     envOr("P2PTUN_ID", ""),
-		peer:   envOr("P2PTUN_PEER", ""),
-		secret: envOr("P2PTUN_SECRET", ""),
-		target: envOr("P2PTUN_TARGET", "127.0.0.1:22"),
-		listen: envOr("P2PTUN_LISTEN", "127.0.0.1:2222"),
-		broker: envOr("P2PTUN_BROKER", defaultBroker),
-		key:    envOr("P2PTUN_KEY", defaultKey),
-		stun:   splitCSV(envOr("P2PTUN_STUN", defaultSTUN)),
+		mode:          mode,
+		id:            envOr("P2PTUN_ID", ""),
+		peer:          envOr("P2PTUN_PEER", ""),
+		secret:        envOr("P2PTUN_SECRET", ""),
+		target:        envOr("P2PTUN_TARGET", "127.0.0.1:22"),
+		listen:        envOr("P2PTUN_LISTEN", "127.0.0.1:2222"),
+		broker:        envOr("P2PTUN_BROKER", defaultBroker),
+		key:           envOr("P2PTUN_KEY", defaultKey),
+		stun:          splitCSV(envOr("P2PTUN_STUN", defaultSTUN)),
+		proto:         envOr("P2PTUN_PROTO", "hy2"),
+		bandwidthMbps: envInt("P2PTUN_BANDWIDTH", 50),
 	}
 	fs.StringVar(&cfg.id, "id", cfg.id, "peer id")
 	fs.StringVar(&cfg.peer, "peer", cfg.peer, "remote peer id (connect)")
@@ -118,6 +137,8 @@ func parseConfig(args []string, mode string) (config, error) {
 	fs.StringVar(&cfg.listen, "listen", cfg.listen, "local listen addr (connect)")
 	fs.StringVar(&cfg.broker, "broker", cfg.broker, "signaling broker URL")
 	fs.StringVar(&cfg.key, "key", cfg.key, "PeerJS api key")
+	fs.StringVar(&cfg.proto, "proto", cfg.proto, "transport protocol: hy2 (default), quic, classic")
+	fs.IntVar(&cfg.bandwidthMbps, "bandwidth", cfg.bandwidthMbps, "target bandwidth in Mbps for Hysteria 2 Brutal CC")
 	stun := ""
 	fs.StringVar(&stun, "stun", "", "STUN servers, comma separated")
 	if err := fs.Parse(args); err != nil {
@@ -305,8 +326,14 @@ func exposeOnce(cfg config) error {
 
 	var dcOpened atomic.Bool
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+		if dc.Label() == controlDataChannelLabel {
+			log.Printf("expose: control datachannel open (label=%s)", dc.Label())
+			dcOpened.Store(true)
+			go runNativeUDPExpose(cfg, dc, cancelFn)
+			return
+		}
 		dc.OnOpen(func() {
-			log.Printf("expose: datachannel open")
+			log.Printf("expose: datachannel open (classic)")
 			dcOpened.Store(true)
 			t := newTransport(dc, func(typ uint8, id uint32, payload []byte) {
 				trMu.Lock()
@@ -506,18 +533,23 @@ func portOf(addr string) string {
 }
 
 type tunnelSess struct {
-	cfg     config
-	connCh  chan net.Conn
-	peer    string
-	token   string
-	pc      *webrtc.PeerConnection
-	scMu    sync.Mutex
-	sc      *signalingClient
-	tr      *transport
-	trReady chan struct{}
-	reg     *streamReg
-	cancel  chan struct{}
-	once    sync.Once
+	cfg       config
+	connCh    chan net.Conn
+	peer      string
+	token     string
+	pc        *webrtc.PeerConnection
+	scMu      sync.Mutex
+	sc        *signalingClient
+	tr        *transport
+	trReady   chan struct{}
+	readyOnce sync.Once
+	reg       *streamReg
+	cancel    chan struct{}
+	once      sync.Once
+	hy2Mu     sync.Mutex
+	hy2Client hyClient.Client
+	quicMu    sync.Mutex
+	quicConn  *quic.Conn
 }
 
 func newTunnelSess(cfg config, connCh chan net.Conn, peer string) *tunnelSess {
@@ -554,13 +586,21 @@ func (s *tunnelSess) run() error {
 	s.pc = pc
 	sdp := &sdpState{}
 
-	dc, err := pc.CreateDataChannel("p2ptun", &webrtc.DataChannelInit{Ordered: boolPtr(true)})
+	label := controlDataChannelLabel
+	if s.cfg.proto == "classic" {
+		label = "p2ptun"
+	}
+	dc, err := pc.CreateDataChannel(label, &webrtc.DataChannelInit{Ordered: boolPtr(true)})
 	if err != nil {
 		return err
 	}
 	var trMu sync.Mutex
 	dc.OnOpen(func() {
-		log.Printf("connect: datachannel open")
+		log.Printf("connect: datachannel open (label=%s)", dc.Label())
+		if dc.Label() == controlDataChannelLabel {
+			go runNativeUDPConnect(s, dc)
+			return
+		}
 		t := newTransport(dc, func(typ uint8, id uint32, payload []byte) {
 			trMu.Lock()
 			cur := s.tr
@@ -573,7 +613,7 @@ func (s *tunnelSess) run() error {
 		trMu.Lock()
 		s.tr = t
 		trMu.Unlock()
-		close(s.trReady)
+		s.readyOnce.Do(func() { close(s.trReady) })
 	})
 	dc.OnClose(func() { s.cancelFn() })
 
@@ -686,6 +726,51 @@ func (s *tunnelSess) registerConn(c net.Conn) {
 		c.Close()
 		return
 	}
+
+	if s.cfg.proto == "hy2" {
+		s.hy2Mu.Lock()
+		client := s.hy2Client
+		s.hy2Mu.Unlock()
+		if client == nil {
+			c.Close()
+			return
+		}
+		go func() {
+			defer c.Close()
+			targetStream, err := client.TCP("target")
+			if err != nil {
+				log.Printf("connect: hy2 open stream failed: %v", err)
+				return
+			}
+			defer targetStream.Close()
+			tuneTCPConn(c)
+			pipeBidirectional(c, targetStream)
+		}()
+		return
+	}
+
+	if s.cfg.proto == "quic" {
+		s.quicMu.Lock()
+		qConn := s.quicConn
+		s.quicMu.Unlock()
+		if qConn == nil {
+			c.Close()
+			return
+		}
+		go func() {
+			defer c.Close()
+			stream, err := qConn.OpenStreamSync(context.Background())
+			if err != nil {
+				log.Printf("connect: quic open stream failed: %v", err)
+				return
+			}
+			defer stream.Close()
+			tuneTCPConn(c)
+			pipeBidirectional(c, stream)
+		}()
+		return
+	}
+
 	id := s.reg.allocID()
 	st := &stream{id: id, conn: c, ch: make(chan []byte, 1024), stopped: make(chan struct{}), finCh: make(chan struct{})}
 	s.reg.add(st)
@@ -700,6 +785,18 @@ func (s *tunnelSess) registerConn(c net.Conn) {
 
 func (s *tunnelSess) teardown() {
 	s.cancelFn()
+	s.hy2Mu.Lock()
+	if s.hy2Client != nil {
+		_ = s.hy2Client.Close()
+		s.hy2Client = nil
+	}
+	s.hy2Mu.Unlock()
+	s.quicMu.Lock()
+	if s.quicConn != nil {
+		_ = s.quicConn.CloseWithError(0, "bye")
+		s.quicConn = nil
+	}
+	s.quicMu.Unlock()
 	if s.pc != nil {
 		s.pc.Close()
 	}
