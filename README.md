@@ -1,9 +1,14 @@
-# p2ptun (v0.2.1)
+# p2ptun (v0.4.0)
 
-P2P TCP tunnel for remote SSH and TCP services, built on **PeerJS signaling + WebRTC DataChannel**.
+P2P TCP tunnel for remote SSH, proxies, and TCP services, built on **PeerJS signaling + WebRTC DataChannel** with **Hysteria 2 (Brutal CC)** transport acceleration.
 
 - **Signaling**: PeerJS cloud (`wss://0.peerjs.com,wss://1.peerjs.com`) or self-hosted PeerJS server — exchanges SDP/ICE only.
 - **Data plane**: WebRTC DataChannel, pure P2P (ICE + STUN) by default, with optional TURN relay support (`-turn`) for strict symmetric NAT / UDP-blocked networks.
+- **Hysteria 2 & Brutal Congestion Control (`v0.4.0`)**:
+  - **抗跨洋丢包加速**: 基于 WebRTC DataChannel 承载 Hysteria 2 (`github.com/apernet/hysteria/core/v2`)，默认启用 Brutal 拥塞控制算法。针对跨境长延迟（RTT ~180ms+）伴随丢包的网络环境，彻底解决传统 Cubic/BBR 遇到丢包窗口断崖式腰斩的问题，按预设速率（`-bandwidth`，默认 50Mbps，支持 100/200Mbps）恒定发包。
+  - **16MB SCTP 接收窗口**: 将底层 Pion SCTP `MaxReceiveBufferSize` 由默认 1MB 提升至 16MB，彻底消除大 BDP（带宽延迟积）链路瓶颈；回环压测吞吐率突破 **112+ Mbps**。
+  - **多协议灵活自适应**: 支持三模切换：`-proto hy2`（默认，Hysteria 2 Brutal CC）、`-proto quic`（标准 QUIC/Cubic）、`-proto classic`（轻量 9-字节自定义帧多路复用）。
+  - **Web 预览适配**: HTTP 状态接口根路径 `/` 自动 307 重定向至 `/status`，完美兼容 Google Cloud Shell Web Preview 及常见反向代理。
 - **Security & Stability Hardening (`v0.2.1`)**:
   - 配对密钥不再进入日志与进程列表（`-daemon` 子进程改由 `P2PTUN_SECRET` 传递）；`~/.p2ptun` 目录 0700、日志/pidfile 0600。
   - `/reconnect`、`/quit` 仅接受 POST + 同源校验（防 CSRF）；新增 `/quit` 优雅退出（Windows 无信号可用）。
@@ -15,25 +20,43 @@ P2P TCP tunnel for remote SSH and TCP services, built on **PeerJS signaling + We
   - **多网络环境自适应 (Network Resilience)**: Real UDP/TCP 53 DNS probing & fallback, multi-broker failover, ambient proxy auto-fallback for signaling, DataChannel Ping/Pong keepalive + RTT tracking, local IP/interface change watcher (Wi-Fi ↔ 5G roaming), and optional `-on-demand` battery-saving mode.
 
 ```
-Termux / remote clients (N)      WSL / service owner
-┌──────────────────────┐        ┌────────────────────────┐
-│  127.0.0.1:2222      │ WebRTC │  exposeManager         │
-│  p2ptun connect (-d) │◄──────►│  p2ptun expose (-d)    │
-└──────────┬───────────┘  DC    │  └─► TCP 127.0.0.1:22  │
-           │  SDP/ICE only      └───────────┬────────────┘
-           └──────────► PeerJS cloud ◄──────┘
+Termux / remote clients (N)             WSL / Server (service owner)
+┌──────────────────────────────┐        ┌──────────────────────────────┐
+│  127.0.0.1:1080 (or :2222)   │ WebRTC │  exposeManager               │
+│  p2ptun connect (-d)         │◄──────►│  p2ptun expose (-d)          │
+│  [Hysteria 2 / Brutal CC]    │  DC    │  └─► TCP 127.0.0.1:1080/:22  │
+└──────────────┬───────────────┘        └──────────────┬───────────────┘
+               │         SDP/ICE only                  │
+               └──────────────► PeerJS cloud ◄─────────┘
 ```
 
 ## Quick Start
 
+### 场景 A：极速代理隧道（以 simple-http-proxy 为例）
+
 ```sh
-# 1. Service owner (e.g. WSL / Linux server, sshd on 127.0.0.1:22)
+# 1. 服务端 (如 Cloud Shell / 海外 VPS，运行代理服务于 1080)
+p2ptun expose -id goproxy-tunnel -secret p2pproxy2026 -target 127.0.0.1:1080 -status-addr 0.0.0.0:8080 -bandwidth 100
+
+# 2. 客户端 (本地电脑，如 Windows PowerShell / macOS / Termux)
+p2ptun connect -peer goproxy-tunnel -secret p2pproxy2026 -listen 127.0.0.1:1080 -proto hy2 -bandwidth 100
+
+# 3. 本地浏览器设置 HTTP/SOCKS5 代理为 127.0.0.1:1080 即可极速冲浪
+```
+
+### 场景 B：远程 SSH 穿透
+
+```sh
+# 1. 目标机 (如 WSL / Linux 服务器，sshd 监听 127.0.0.1:22)
 P2PTUN_ID=wslssh-a1b2 P2PTUN_SECRET=hunter2 p2ptun expose -daemon
 
-# 2. Remote client (e.g. Termux / laptop) — then: ssh -p 2222 user@127.0.0.1
+# 2. 客户端 (本地笔记本 / Termux)
 P2PTUN_PEER=wslssh-a1b2 P2PTUN_SECRET=hunter2 p2ptun connect -listen 127.0.0.1:2222 -daemon
 
-# 3. Check daemon status / RTT / traffic counters or stop daemon
+# 3. 连接
+ssh -p 2222 user@127.0.0.1
+
+# 4. 查看状态与停止
 p2ptun status
 p2ptun stop
 ```
@@ -42,11 +65,13 @@ p2ptun stop
 
 | Flag | Env | Description |
 |---|---|---|
-| `-id` | `P2PTUN_ID` | Peer ID on the signaling server |
+| `-id` | `P2PTUN_ID` | Peer ID on the signaling server (`expose`) |
 | `-secret` | `P2PTUN_SECRET` | Pairing secret (must match on both sides) |
-| `-peer` | `P2PTUN_PEER` | Remote expose peer ID (connect side) |
+| `-peer` | `P2PTUN_PEER` | Remote expose peer ID (`connect`) |
 | `-target` | `P2PTUN_TARGET` | Exposed TCP endpoint (`expose`, default `127.0.0.1:22`) |
 | `-listen` | `P2PTUN_LISTEN` | Local listen addr (`connect`, default `127.0.0.1:2222`) |
+| `-proto` | `P2PTUN_PROTO` | Transport layer protocol: `hy2` (Hysteria 2 Brutal CC, default), `quic` (Standard QUIC/Cubic), `classic` (lightweight multiplexing) |
+| `-bandwidth` | `P2PTUN_BANDWIDTH` | Target bandwidth in Mbps for Hysteria 2 Brutal CC (default `50`) |
 | `-broker` | `P2PTUN_BROKER` | Comma-separated signaling brokers (default `wss://0.peerjs.com,wss://1.peerjs.com`) |
 | `-key` | `P2PTUN_KEY` | PeerJS API key (default `peerjs`) |
 | `-stun` | `P2PTUN_STUN` | Comma-separated STUN servers |
@@ -64,7 +89,7 @@ p2ptun stop
 | `-pidfile` | `P2PTUN_PIDFILE` | Custom PID file path |
 | `-logfile` | `P2PTUN_LOGFILE` | Custom rotating log file path |
 | `-log-max-mb` | `P2PTUN_LOG_MAX_MB` | Max log size in MB before rotation (default `10`) |
-| `-status-addr` | `P2PTUN_STATUS_ADDR` | Local HTTP status & healthcheck endpoint (e.g. `127.0.0.1:18222`). 无默认值，不指定则不监听；**避开 9222/9223（Chromium/Edge CDP 默认端口）与 9229（Node inspector）** |
+| `-status-addr` | `P2PTUN_STATUS_ADDR` | Local HTTP status & healthcheck endpoint (e.g. `0.0.0.0:8080` or `127.0.0.1:18222`). 支持 `/status` 查看 JSON 详情，根路径 `/` 自动跳转 |
 | — | `P2PTUN_DNS` | Custom DNS servers CSV (default auto-probes `/etc/resolv.conf` + `223.5.5.5,119.29.29.29,114.114.114.114,8.8.8.8,1.1.1.1`) |
 
 ## Daemon & Service Setup
@@ -104,5 +129,5 @@ CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags '-s -w' -o p2p
 
 ## Documentation
 
-- [`docs/architecture.md`](docs/architecture.md) — signaling, frame protocol (`SYN`/`DATA`/`FIN`/`PING`/`PONG`/`RST`), multi-peer manager, DNS/network resilience
+- [`docs/architecture.md`](docs/architecture.md) — signaling, Hysteria 2 / QUIC / frame protocol, multi-peer manager, DNS/network resilience
 - [`docs/troubleshooting.md`](docs/troubleshooting.md) — diagnostics, NAT/UDP checks, TURN configuration, daemon operations
