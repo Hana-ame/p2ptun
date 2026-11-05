@@ -339,6 +339,13 @@ func startStatusServer(addr string, stop <-chan struct{}, quit func()) (net.List
 		return nil, err
 	}
 	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		http.Redirect(w, r, "/status", http.StatusTemporaryRedirect)
+	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		snap := globalStats.snapshot()
 		w.Header().Set("Content-Type", "application/json")
