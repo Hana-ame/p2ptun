@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/pion/webrtc/v4"
+	"github.com/quic-go/quic-go"
 )
 
 const (
@@ -127,6 +128,7 @@ type config struct {
 	logFile     string
 	logMaxMB    int
 	statusAddr  string
+	useQUIC     bool
 }
 
 func envOr(key, def string) string {
@@ -138,6 +140,14 @@ func envOr(key, def string) string {
 
 func envBool(key string) bool {
 	v := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	return v == "1" || v == "true" || v == "yes" || v == "on"
+}
+
+func envBoolDefault(key string, def bool) bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	if v == "" {
+		return def
+	}
 	return v == "1" || v == "true" || v == "yes" || v == "on"
 }
 
@@ -186,6 +196,7 @@ func parseConfig(args []string, mode string) (config, error) {
 		logFile:     envOr("P2PTUN_LOGFILE", ""),
 		logMaxMB:    envInt("P2PTUN_LOG_MAX_MB", 10),
 		statusAddr:  envOr("P2PTUN_STATUS_ADDR", ""),
+		useQUIC:     envBoolDefault("P2PTUN_QUIC", true),
 	}
 	fs.StringVar(&cfg.id, "id", cfg.id, "peer id")
 	fs.StringVar(&cfg.peer, "peer", cfg.peer, "remote peer id (connect)")
@@ -214,6 +225,7 @@ func parseConfig(args []string, mode string) (config, error) {
 	fs.StringVar(&cfg.logFile, "logfile", cfg.logFile, "rotating log file path")
 	fs.IntVar(&cfg.logMaxMB, "log-max-mb", cfg.logMaxMB, "max log file size in MB before rotation")
 	fs.StringVar(&cfg.statusAddr, "status-addr", cfg.statusAddr, "local HTTP status server address")
+	fs.BoolVar(&cfg.useQUIC, "quic", cfg.useQUIC, "use QUIC over WebRTC DataChannel (default true)")
 
 	if err := fs.Parse(args); err != nil {
 		return cfg, err
@@ -249,8 +261,8 @@ func parseConfig(args []string, mode string) (config, error) {
 		cfg.maxPeers = 16
 	}
 
-	configuredProxy = cfg.proxy
-	keepAmbientProxy = cfg.keepProxy
+	configuredProxy.Store(&cfg.proxy)
+	keepAmbientProxy.Store(cfg.keepProxy)
 	return cfg, nil
 }
 
@@ -583,7 +595,9 @@ func (es *exposeSession) close() {
 		if tr != nil {
 			tr.closeNoNotify() // 防止 sync.Once 重入死锁 (close() 是 transport 的 onClose)
 		}
-		es.reg.closeAll()
+		if es.reg != nil {
+			es.reg.closeAll()
+		}
 		if es.pc != nil {
 			_ = es.pc.Close()
 		}
@@ -888,8 +902,12 @@ func (m *exposeManager) acceptOffer(src string, sig pjSignal) {
 
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
 		dc.OnOpen(func() {
-			log.Printf("expose: [%s] datachannel open", key)
+			log.Printf("expose: [%s] datachannel open (label=%s)", key, dc.Label())
 			sess.dcOpened.Store(true)
+			if dc.Label() == quicDataChannelLabel {
+				go runQUICExpose(m.cfg, sess, dc)
+				return
+			}
 			// handler 在 OnMessage 注册前拿到 transport 自身, 首帧不会因为
 			// sess.tr 尚未赋值而被丢弃 (OnOpen 与 OnMessage 在不同协程).
 			t := newTransport(dc, func(t *transport) frameHandler {
@@ -1291,6 +1309,10 @@ type tunnelSess struct {
 	sc         *signalingClient
 	trMu       sync.Mutex
 	tr         *transport
+	quicMu     sync.Mutex
+	quicConn   quic.Connection
+	ctx        context.Context
+	ctxCancel  context.CancelFunc
 	trReady    chan struct{}
 	readyOnce  sync.Once
 	wasReady   atomic.Bool
@@ -1303,16 +1325,20 @@ type tunnelSess struct {
 }
 
 func newTunnelSess(cfg config, connCh chan pendingConn, peer string, stop <-chan struct{}) *tunnelSess {
+	cancelCh := make(chan struct{})
+	ctx, cancelFn := contextWithStops(stop, cancelCh)
 	s := &tunnelSess{
-		cfg:     cfg,
-		connCh:  connCh,
-		peer:    peer,
-		connID:  "p2p-" + randHex(6),
-		token:   randHex(12),
-		trReady: make(chan struct{}),
-		reg:     newStreamReg(),
-		cancel:  make(chan struct{}),
-		stop:    stop,
+		cfg:       cfg,
+		connCh:    connCh,
+		peer:      peer,
+		connID:    "p2p-" + randHex(6),
+		token:     randHex(12),
+		trReady:   make(chan struct{}),
+		reg:       newStreamReg(),
+		cancel:    cancelCh,
+		stop:      stop,
+		ctx:       ctx,
+		ctxCancel: cancelFn,
 	}
 	s.lastActive.Store(time.Now().UnixNano())
 	return s
@@ -1330,7 +1356,14 @@ func (s *tunnelSess) getSc() *signalingClient {
 	return s.sc
 }
 
-func (s *tunnelSess) cancelFn() { s.once.Do(func() { close(s.cancel) }) }
+func (s *tunnelSess) cancelFn() {
+	s.once.Do(func() {
+		close(s.cancel)
+		if s.ctxCancel != nil {
+			s.ctxCancel()
+		}
+	})
+}
 
 func (s *tunnelSess) run() error {
 	pc, err := s.cfg.newPeerConn()
@@ -1340,15 +1373,29 @@ func (s *tunnelSess) run() error {
 	s.pc = pc
 	sdp := &sdpState{}
 
-	dc, err := pc.CreateDataChannel("p2ptun", &webrtc.DataChannelInit{Ordered: boolPtr(true)})
+	var dc *webrtc.DataChannel
+	if s.cfg.useQUIC {
+		ordered := false
+		maxRetransmits := uint16(0)
+		dc, err = pc.CreateDataChannel(quicDataChannelLabel, &webrtc.DataChannelInit{
+			Ordered:        &ordered,
+			MaxRetransmits: &maxRetransmits,
+		})
+	} else {
+		dc, err = pc.CreateDataChannel("p2ptun", &webrtc.DataChannelInit{Ordered: boolPtr(true)})
+	}
 	if err != nil {
 		return err
 	}
 	dc.OnOpen(func() {
-		log.Printf("connect: datachannel open (conn=%s)", s.connID)
+		log.Printf("connect: datachannel open (conn=%s, label=%s)", s.connID, dc.Label())
 		s.wasReady.Store(true)
 		s.lastActive.Store(time.Now().UnixNano())
 		globalStats.activePeers.Store(1)
+		if dc.Label() == quicDataChannelLabel {
+			go runQUICConnect(s, dc)
+			return
+		}
 		t := newTransport(dc, func(t *transport) frameHandler {
 			return func(typ uint8, id uint32, payload []byte) {
 				s.lastActive.Store(time.Now().UnixNano())
@@ -1553,6 +1600,32 @@ func (s *tunnelSess) requeue(item pendingConn) {
 }
 
 func (s *tunnelSess) registerConn(item pendingConn) {
+	if s.cfg.useQUIC {
+		s.quicMu.Lock()
+		qConn := s.quicConn
+		s.quicMu.Unlock()
+		if qConn == nil {
+			s.requeue(item)
+			s.cancelFn()
+			return
+		}
+		s.lastActive.Store(time.Now().UnixNano())
+		go func(c net.Conn) {
+			dialCtx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
+			defer cancel()
+			qStream, err := qConn.OpenStreamSync(dialCtx)
+			if err != nil {
+				log.Printf("connect: open quic stream failed: %v", err)
+				_ = c.Close()
+				return
+			}
+			globalStats.activeStreams.Add(1)
+			defer globalStats.activeStreams.Add(-1)
+			pipeStream(c, qStream)
+		}(item.conn)
+		return
+	}
+
 	s.trMu.Lock()
 	tr := s.tr
 	s.trMu.Unlock()
@@ -1597,6 +1670,12 @@ func (s *tunnelSess) registerConn(item pendingConn) {
 
 func (s *tunnelSess) teardown() {
 	s.cancelFn()
+	s.quicMu.Lock()
+	if s.quicConn != nil {
+		_ = s.quicConn.CloseWithError(0, "teardown")
+		s.quicConn = nil
+	}
+	s.quicMu.Unlock()
 	globalStats.activePeers.Store(0)
 	if sc := s.getSc(); sc != nil {
 		sc.sendLeave(s.peer, s.connID)

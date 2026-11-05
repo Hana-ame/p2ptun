@@ -40,8 +40,8 @@ var dnsServers = []string{
 
 var (
 	ambientProxy     string // 启动前环境中存在的代理 URL (用于直连信令失败时可选回退)
-	configuredProxy  string
-	keepAmbientProxy bool
+	configuredProxy  atomic.Pointer[string]
+	keepAmbientProxy atomic.Bool
 
 	dnsMu          sync.RWMutex
 	activeDNSList  []string
@@ -49,6 +49,13 @@ var (
 	dnsDialCounter atomic.Uint64
 	lastDNSDialNs  atomic.Int64
 )
+
+func getConfiguredProxy() string {
+	if p := configuredProxy.Load(); p != nil {
+		return *p
+	}
+	return ""
+}
 
 func init() {
 	// 捕获启动前的环境代理, 以便用户指定 -keep-proxy 或直连信令失败时回退
@@ -420,10 +427,10 @@ func wsDialerWithProxy(proxyStr string) *websocket.Dialer {
 
 // wsDialer 返回默认 websocket dialer (若配置了显式代理或保留代理则启用)
 func wsDialer() *websocket.Dialer {
-	if configuredProxy != "" {
-		return wsDialerWithProxy(configuredProxy)
+	if cp := getConfiguredProxy(); cp != "" {
+		return wsDialerWithProxy(cp)
 	}
-	if keepAmbientProxy && ambientProxy != "" {
+	if keepAmbientProxy.Load() && ambientProxy != "" {
 		return wsDialerWithProxy(ambientProxy)
 	}
 	return wsDialerWithProxy("")

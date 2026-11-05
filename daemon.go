@@ -307,8 +307,15 @@ func maybeDaemonize(cfg *config) (*rotatingFileWriter, func(), error) {
 	return logWriter, cleanup, nil
 }
 
-// crossSiteRequest 判断请求是否来自浏览器跨站页面 (CSRF 防护)。
+// crossSiteRequest 判断请求是否来自浏览器跨站页面 (CSRF / DNS Rebinding 防护)。
 func crossSiteRequest(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(r.Host)
+	if err != nil {
+		host = r.Host
+	}
+	if host != "127.0.0.1" && host != "localhost" && host != "::1" {
+		return true
+	}
 	if origin := r.Header.Get("Origin"); origin != "" {
 		u, err := url.Parse(origin)
 		if err != nil || !strings.EqualFold(u.Host, r.Host) {

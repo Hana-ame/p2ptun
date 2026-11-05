@@ -43,7 +43,7 @@ case "${cmd}" in
             exit 1
         fi
         args=("${MODE}" "-daemon" "-pidfile" "${PID_FILE}" "-logfile" "${LOG_FILE}" "-status-addr" "${STATUS_ADDR}")
-        [ -n "${SECRET}" ] && args+=("-secret" "${SECRET}")
+        [ -n "${SECRET}" ] && export P2PTUN_SECRET="${SECRET}"
         [ -n "${ID}" ] && args+=("-id" "${ID}")
         if [ "${MODE}" = "connect" ]; then
             [ -n "${PEER}" ] && args+=("-peer" "${PEER}")

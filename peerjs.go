@@ -184,7 +184,7 @@ func dialSignaling(ctx context.Context, broker, key, id, token string, onSignal 
 	h.Set("User-Agent", "Mozilla/5.0 (p2ptun/"+version+")")
 
 	ws, resp, err := dialWebSocketCtx(ctx, wsDialer(), u, h)
-	if err != nil && configuredProxy == "" && !keepAmbientProxy && ambientProxy != "" && ctx.Err() == nil {
+	if err != nil && getConfiguredProxy() == "" && !keepAmbientProxy.Load() && ambientProxy != "" && ctx.Err() == nil {
 		// 直连信令失败时, 若启动前环境带有代理 (如国内环境需代理连 0.peerjs.com), 自动尝试代理连接信令
 		log.Printf("peerjs: direct dial %s failed (%v), trying fallback proxy %s", broker, err, ambientProxy)
 		ws, resp, err = dialWebSocketCtx(ctx, wsDialerWithProxy(ambientProxy), u, h)
