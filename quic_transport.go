@@ -168,11 +168,11 @@ func defaultQUICConfig() *quic.Config {
 		KeepAlivePeriod:                10 * time.Second,
 		DisablePathMTUDiscovery:        true,
 		InitialPacketSize:              1200,
-		MaxIncomingStreams:             1000,
-		InitialStreamReceiveWindow:     1 << 20, // 1MB
-		MaxStreamReceiveWindow:         4 << 20, // 4MB
-		InitialConnectionReceiveWindow: 2 << 20, // 2MB
-		MaxConnectionReceiveWindow:     16 << 20,
+		MaxIncomingStreams:             2000,
+		InitialStreamReceiveWindow:     4 << 20, // 4MB
+		MaxStreamReceiveWindow:         16 << 20, // 16MB
+		InitialConnectionReceiveWindow: 8 << 20, // 8MB
+		MaxConnectionReceiveWindow:     64 << 20, // 64MB
 		EnableDatagrams:                true,
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"math/big"
 	"net"
@@ -20,12 +21,13 @@ import (
 	"syscall"
 	"time"
 
+	hyClient "github.com/apernet/hysteria/core/v2/client"
 	"github.com/pion/webrtc/v4"
 	"github.com/quic-go/quic-go"
 )
 
 const (
-	version = "0.2.1"
+	version = "0.4.0"
 
 	defaultBroker = "wss://0.peerjs.com,wss://1.peerjs.com"
 	defaultKey    = "peerjs"
@@ -127,8 +129,10 @@ type config struct {
 	pidFile     string
 	logFile     string
 	logMaxMB    int
-	statusAddr  string
-	useQUIC     bool
+	statusAddr    string
+	useQUIC       bool
+	proto         string
+	bandwidthMbps int
 }
 
 func envOr(key, def string) string {
@@ -195,8 +199,10 @@ func parseConfig(args []string, mode string) (config, error) {
 		pidFile:     envOr("P2PTUN_PIDFILE", ""),
 		logFile:     envOr("P2PTUN_LOGFILE", ""),
 		logMaxMB:    envInt("P2PTUN_LOG_MAX_MB", 10),
-		statusAddr:  envOr("P2PTUN_STATUS_ADDR", ""),
-		useQUIC:     envBoolDefault("P2PTUN_QUIC", true),
+		statusAddr:    envOr("P2PTUN_STATUS_ADDR", ""),
+		useQUIC:       envBoolDefault("P2PTUN_QUIC", true),
+		proto:         envOr("P2PTUN_PROTO", "hy2"),
+		bandwidthMbps: envInt("P2PTUN_BANDWIDTH", 50),
 	}
 	fs.StringVar(&cfg.id, "id", cfg.id, "peer id")
 	fs.StringVar(&cfg.peer, "peer", cfg.peer, "remote peer id (connect)")
@@ -225,10 +231,19 @@ func parseConfig(args []string, mode string) (config, error) {
 	fs.StringVar(&cfg.logFile, "logfile", cfg.logFile, "rotating log file path")
 	fs.IntVar(&cfg.logMaxMB, "log-max-mb", cfg.logMaxMB, "max log file size in MB before rotation")
 	fs.StringVar(&cfg.statusAddr, "status-addr", cfg.statusAddr, "local HTTP status server address")
-	fs.BoolVar(&cfg.useQUIC, "quic", cfg.useQUIC, "use QUIC over WebRTC DataChannel (default true)")
+	fs.BoolVar(&cfg.useQUIC, "quic", cfg.useQUIC, "use QUIC over WebRTC DataChannel")
+	fs.StringVar(&cfg.proto, "proto", cfg.proto, "transport protocol: hy2 (Hysteria2 Brutal, default), quic, or classic")
+	fs.IntVar(&cfg.bandwidthMbps, "bandwidth", cfg.bandwidthMbps, "target bandwidth in Mbps for Hysteria2 Brutal CC (default 50)")
 
 	if err := fs.Parse(args); err != nil {
 		return cfg, err
+	}
+	cfg.proto = strings.ToLower(strings.TrimSpace(cfg.proto))
+	if !cfg.useQUIC && cfg.proto != "hy2" {
+		cfg.proto = "classic"
+	}
+	if cfg.bandwidthMbps <= 0 {
+		cfg.bandwidthMbps = 50
 	}
 
 	if stun != "" {
@@ -347,6 +362,8 @@ func (c config) newPeerConn() (*webrtc.PeerConnection, error) {
 	// 放宽短暂断连容忍度 (10s disconnected -> 25s failed, 2s ICE keepalive),
 	// 避免手机基站切换或瞬间丢包导致连接误断, 同时结合 DataChannel ping 快速识别真正断网
 	se.SetICETimeouts(10*time.Second, 25*time.Second, 2*time.Second)
+	// 扩大 SCTP 接收缓冲区至 16MB (默认仅 1MB), 避免高 RTT 跨洋链路下 BDP 瓶颈限速
+	se.SetSCTPMaxReceiveBufferSize(16 * 1024 * 1024)
 
 	if c.icePorts != "" {
 		parts := strings.Split(c.icePorts, "-")
@@ -904,6 +921,10 @@ func (m *exposeManager) acceptOffer(src string, sig pjSignal) {
 		dc.OnOpen(func() {
 			log.Printf("expose: [%s] datachannel open (label=%s)", key, dc.Label())
 			sess.dcOpened.Store(true)
+			if dc.Label() == hy2DataChannelLabel {
+				go runHy2Expose(m.cfg, sess, dc)
+				return
+			}
 			if dc.Label() == quicDataChannelLabel {
 				go runQUICExpose(m.cfg, sess, dc)
 				return
@@ -1311,6 +1332,8 @@ type tunnelSess struct {
 	tr         *transport
 	quicMu     sync.Mutex
 	quicConn   quic.Connection
+	hy2Mu      sync.Mutex
+	hy2Client  hyClient.Client
 	ctx        context.Context
 	ctxCancel  context.CancelFunc
 	trReady    chan struct{}
@@ -1374,15 +1397,22 @@ func (s *tunnelSess) run() error {
 	sdp := &sdpState{}
 
 	var dc *webrtc.DataChannel
-	if s.cfg.useQUIC {
+	label := "p2ptun"
+	if s.cfg.proto == "hy2" {
+		label = hy2DataChannelLabel
+	} else if s.cfg.proto == "quic" || (s.cfg.proto == "" && s.cfg.useQUIC) {
+		label = quicDataChannelLabel
+	}
+
+	if label == "p2ptun" {
+		dc, err = pc.CreateDataChannel("p2ptun", &webrtc.DataChannelInit{Ordered: boolPtr(true)})
+	} else {
 		ordered := false
 		maxRetransmits := uint16(0)
-		dc, err = pc.CreateDataChannel(quicDataChannelLabel, &webrtc.DataChannelInit{
+		dc, err = pc.CreateDataChannel(label, &webrtc.DataChannelInit{
 			Ordered:        &ordered,
 			MaxRetransmits: &maxRetransmits,
 		})
-	} else {
-		dc, err = pc.CreateDataChannel("p2ptun", &webrtc.DataChannelInit{Ordered: boolPtr(true)})
 	}
 	if err != nil {
 		return err
@@ -1392,6 +1422,10 @@ func (s *tunnelSess) run() error {
 		s.wasReady.Store(true)
 		s.lastActive.Store(time.Now().UnixNano())
 		globalStats.activePeers.Store(1)
+		if dc.Label() == hy2DataChannelLabel {
+			go runHy2Connect(s, dc)
+			return
+		}
 		if dc.Label() == quicDataChannelLabel {
 			go runQUICConnect(s, dc)
 			return
@@ -1600,7 +1634,48 @@ func (s *tunnelSess) requeue(item pendingConn) {
 }
 
 func (s *tunnelSess) registerConn(item pendingConn) {
-	if s.cfg.useQUIC {
+	if s.cfg.proto == "hy2" {
+		s.hy2Mu.Lock()
+		client := s.hy2Client
+		s.hy2Mu.Unlock()
+		if client == nil {
+			s.requeue(item)
+			s.cancelFn()
+			return
+		}
+		s.lastActive.Store(time.Now().UnixNano())
+		go func(c net.Conn) {
+			globalStats.activeStreams.Add(1)
+			defer globalStats.activeStreams.Add(-1)
+			targetStream, err := client.TCP("target")
+			if err != nil {
+				log.Printf("connect: hy2 tcp failed: %v", err)
+				_ = c.Close()
+				return
+			}
+			defer targetStream.Close()
+			defer c.Close()
+			tuneTCPConn(c)
+			var wg sync.WaitGroup
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				_, _ = io.Copy(targetStream, c)
+				_ = targetStream.Close()
+			}()
+			go func() {
+				defer wg.Done()
+				_, _ = io.Copy(c, targetStream)
+				if cw, ok := c.(interface{ CloseWrite() error }); ok {
+					_ = cw.CloseWrite()
+				}
+			}()
+			wg.Wait()
+		}(item.conn)
+		return
+	}
+
+	if s.cfg.proto == "quic" || s.cfg.useQUIC {
 		s.quicMu.Lock()
 		qConn := s.quicConn
 		s.quicMu.Unlock()
@@ -1670,6 +1745,12 @@ func (s *tunnelSess) registerConn(item pendingConn) {
 
 func (s *tunnelSess) teardown() {
 	s.cancelFn()
+	s.hy2Mu.Lock()
+	if s.hy2Client != nil {
+		_ = s.hy2Client.Close()
+		s.hy2Client = nil
+	}
+	s.hy2Mu.Unlock()
 	s.quicMu.Lock()
 	if s.quicConn != nil {
 		_ = s.quicConn.CloseWithError(0, "teardown")
