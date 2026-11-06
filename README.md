@@ -1,6 +1,6 @@
-# p2ptun (v0.2.2)
+# p2ptun (v0.5.0)
 
-P2P TCP tunnel for remote SSH and TCP proxies, merging **v0.1.7 (PeerJS SCTP Control Scheduling + Native ICE UDP with Hysteria 2 / QUIC)** and **v0.2.1 (Multi-Peer `exposeManager`, Daemonization, Network Resilience & Security Hardening)**.
+P2P TCP tunnel for remote SSH and TCP proxies, featuring **PeerJS SCTP Control Scheduling + Native ICE UDP Direct Punching (Hysteria 2 / QUIC)** with **Enterprise Multi-Peer Daemonization & Security Hardening**.
 
 - **调度面 (Control Plane)**: PeerJS (`wss://0.peerjs.com,wss://1.peerjs.com` 多服容灾) 交换 SDP；WebRTC SCTP DataChannel (`p2ptun-control`) 仅用于配对认证、协议协商与原生 UDP 候选地址调度，**不经过业务数据**。
 - **数据面 (Data Plane)**: 两端经 SCTP 调度后通过 **原生裸 UDP**（基于 `pion/ice/v4` 原生打洞）建立纯 P2P 直连，彻底剔除 DTLS + SCTP 的双重加密与 1 秒 RTO 限制：
