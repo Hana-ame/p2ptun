@@ -279,6 +279,42 @@ func TestRotatingLogAndStatusServer(t *testing.T) {
 	}
 }
 
+func TestControlPanelDisabledByDefaultAndFlags(t *testing.T) {
+	// 默认不指定任何监听地址时, statusAddr 必须为空, 且 startStatusServer 返回 nil, nil (不开启)
+	cfg, err := parseConfig([]string{"-secret", "sec", "-id", "id1"}, "expose")
+	if err != nil {
+		t.Fatalf("parseConfig error: %v", err)
+	}
+	if cfg.statusAddr != "" {
+		t.Fatalf("expected statusAddr to be empty by default, got %q", cfg.statusAddr)
+	}
+	lis, err := startStatusServer(cfg.statusAddr, make(chan struct{}), nil)
+	if err != nil {
+		t.Fatalf("expected nil error on empty statusAddr, got: %v", err)
+	}
+	if lis != nil {
+		t.Fatalf("expected nil listener on empty statusAddr, got: %v", lis)
+	}
+
+	// 指定 -panel-addr 时生效
+	cfgPanel, err := parseConfig([]string{"-secret", "sec", "-id", "id1", "-panel-addr", "127.0.0.1:18225"}, "expose")
+	if err != nil {
+		t.Fatalf("parseConfig with -panel-addr error: %v", err)
+	}
+	if cfgPanel.statusAddr != "127.0.0.1:18225" {
+		t.Fatalf("expected statusAddr=127.0.0.1:18225, got %q", cfgPanel.statusAddr)
+	}
+
+	// 指定 -control-addr 时生效
+	cfgCtrl, err := parseConfig([]string{"-secret", "sec", "-id", "id1", "-control-addr", "127.0.0.1:18226"}, "expose")
+	if err != nil {
+		t.Fatalf("parseConfig with -control-addr error: %v", err)
+	}
+	if cfgCtrl.statusAddr != "127.0.0.1:18226" {
+		t.Fatalf("expected statusAddr=127.0.0.1:18226, got %q", cfgCtrl.statusAddr)
+	}
+}
+
 func TestSignalingIDTakenAndReconnect(t *testing.T) {
 	broker := newMockPeerJSServer()
 	defer broker.close()

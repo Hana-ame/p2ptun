@@ -26,7 +26,7 @@ import (
 )
 
 const (
-	version = "0.5.0"
+	version = "0.5.1"
 
 	defaultBroker = "wss://0.peerjs.com,wss://1.peerjs.com"
 	defaultKey    = "peerjs"
@@ -100,7 +100,8 @@ common flags (env fallbacks in parens):
   -daemon, -d       run in background daemon mode          (P2PTUN_DAEMON)
   -pidfile PATH     write process PID to file              (P2PTUN_PIDFILE)
   -logfile PATH     rotating log output path               (P2PTUN_LOGFILE)
-  -status-addr H:P  local HTTP status/health endpoint      (P2PTUN_STATUS_ADDR)
+  -status-addr H:P  local HTTP status/control panel addr   (P2PTUN_STATUS_ADDR, optional, disabled by default)
+  -panel-addr H:P   alias for -status-addr
 `, version, defaultBroker)
 }
 
@@ -211,7 +212,7 @@ func parseConfig(args []string, mode string) (config, error) {
 		pidFile:       envOr("P2PTUN_PIDFILE", ""),
 		logFile:       envOr("P2PTUN_LOGFILE", ""),
 		logMaxMB:      envInt("P2PTUN_LOG_MAX_MB", 10),
-		statusAddr:    envOr("P2PTUN_STATUS_ADDR", ""),
+		statusAddr:    envOr("P2PTUN_STATUS_ADDR", envOr("P2PTUN_PANEL_ADDR", envOr("P2PTUN_CONTROL_ADDR", ""))),
 		proto:         defProto,
 		bandwidthMbps: envInt("P2PTUN_BANDWIDTH", 50),
 		useQUIC:       envBoolDefault("P2PTUN_QUIC", true),
@@ -246,11 +247,21 @@ func parseConfig(args []string, mode string) (config, error) {
 	fs.StringVar(&cfg.pidFile, "pidfile", cfg.pidFile, "PID file path")
 	fs.StringVar(&cfg.logFile, "logfile", cfg.logFile, "rotating log file path")
 	fs.IntVar(&cfg.logMaxMB, "log-max-mb", cfg.logMaxMB, "max log file size in MB before rotation")
-	fs.StringVar(&cfg.statusAddr, "status-addr", cfg.statusAddr, "local HTTP status server address")
+	panelAddrAlias := ""
+	controlAddrAlias := ""
+	fs.StringVar(&cfg.statusAddr, "status-addr", cfg.statusAddr, "local HTTP status/control panel server address (optional, off by default)")
+	fs.StringVar(&panelAddrAlias, "panel-addr", "", "alias for -status-addr")
+	fs.StringVar(&controlAddrAlias, "control-addr", "", "alias for -status-addr")
 	fs.BoolVar(&cfg.useQUIC, "quic", cfg.useQUIC, "use QUIC/Hysteria2 transport (set -quic=false for classic)")
 
 	if err := fs.Parse(args); err != nil {
 		return cfg, err
+	}
+
+	if panelAddrAlias != "" {
+		cfg.statusAddr = panelAddrAlias
+	} else if controlAddrAlias != "" {
+		cfg.statusAddr = controlAddrAlias
 	}
 
 	if transportAlias != "" {

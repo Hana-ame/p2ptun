@@ -1,4 +1,4 @@
-# p2ptun (v0.5.0)
+# p2ptun (v0.5.1)
 
 P2P TCP tunnel for remote SSH and TCP proxies, featuring **PeerJS SCTP Control Scheduling + Native ICE UDP Direct Punching (Hysteria 2 / QUIC)** with **Enterprise Multi-Peer Daemonization & Security Hardening**.
 
@@ -70,7 +70,7 @@ p2ptun stop
 | `-pidfile` | `P2PTUN_PIDFILE` | Custom PID file path |
 | `-logfile` | `P2PTUN_LOGFILE` | Custom rotating log file path |
 | `-log-max-mb` | `P2PTUN_LOG_MAX_MB` | Max log size in MB before rotation (default `10`) |
-| `-status-addr` | `P2PTUN_STATUS_ADDR` | Local HTTP status & healthcheck endpoint (e.g. `127.0.0.1:18222`) |
+| `-status-addr` / `-panel-addr` | `P2PTUN_STATUS_ADDR` | Local HTTP status & control panel endpoint (optional, off by default unless specified) |
 | — | `P2PTUN_DNS` | Custom DNS servers CSV |
 
 ## Build & Test

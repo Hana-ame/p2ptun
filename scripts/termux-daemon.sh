@@ -9,8 +9,8 @@ SECRET="${P2PTUN_SECRET:-}"
 ID="${P2PTUN_ID:-}"
 LISTEN="${P2PTUN_LISTEN:-127.0.0.1:2222}"
 TARGET="${P2PTUN_TARGET:-127.0.0.1:22}"
-# 默认 18222: 避开 9222/9223 (Chromium/Edge CDP) 与 9229 (Node inspector)
-STATUS_ADDR="${P2PTUN_STATUS_ADDR:-127.0.0.1:18222}"
+# 控制面板/状态服务监听地址: 默认不开启 (未指定时不开启 HTTP 状态服务)
+STATUS_ADDR="${P2PTUN_STATUS_ADDR:-}"
 STATE_DIR="${HOME}/.p2ptun"
 ENV_FILE="${STATE_DIR}/config.env"
 PID_FILE="${STATE_DIR}/p2ptun-${MODE}.pid"
@@ -42,7 +42,8 @@ case "${cmd}" in
             echo "Error: p2ptun binary not found in PATH or current directory" >&2
             exit 1
         fi
-        args=("${MODE}" "-daemon" "-pidfile" "${PID_FILE}" "-logfile" "${LOG_FILE}" "-status-addr" "${STATUS_ADDR}")
+        args=("${MODE}" "-daemon" "-pidfile" "${PID_FILE}" "-logfile" "${LOG_FILE}")
+        [ -n "${STATUS_ADDR}" ] && args+=("-status-addr" "${STATUS_ADDR}")
         [ -n "${SECRET}" ] && export P2PTUN_SECRET="${SECRET}"
         [ -n "${ID}" ] && args+=("-id" "${ID}")
         if [ "${MODE}" = "connect" ]; then
@@ -71,7 +72,9 @@ case "${cmd}" in
         ;;
     status)
         if [ -n "${BIN}" ]; then
-            "${BIN}" status -mode "${MODE}" -pidfile "${PID_FILE}" -status-addr "${STATUS_ADDR}"
+            status_args=("-mode" "${MODE}" "-pidfile" "${PID_FILE}")
+            [ -n "${STATUS_ADDR}" ] && status_args+=("-status-addr" "${STATUS_ADDR}")
+            "${BIN}" status "${status_args[@]}"
         elif [ -f "${PID_FILE}" ]; then
             echo "PID: $(cat "${PID_FILE}")"
             tail -n 15 "${LOG_FILE}" 2>/dev/null || true
@@ -87,11 +90,13 @@ case "${cmd}" in
         BOOT_DIR="${HOME}/.termux/boot"
         mkdir -p "${BOOT_DIR}"
         BOOT_SCRIPT="${BOOT_DIR}/start-p2ptun.sh"
+        status_flag=""
+        [ -n "${STATUS_ADDR}" ] && status_flag=" -status-addr \"${STATUS_ADDR}\""
         cat > "${BOOT_SCRIPT}" <<EOF
 #!/data/data/com.termux/files/usr/bin/sh
 termux-wake-lock
 if [ -f "${ENV_FILE}" ]; then set -a; . "${ENV_FILE}"; set +a; fi
-exec "${BIN:-p2ptun}" ${MODE} -daemon -pidfile "${PID_FILE}" -logfile "${LOG_FILE}" -status-addr "${STATUS_ADDR}"
+exec "\${BIN:-p2ptun}" \${MODE} -daemon -pidfile "\${PID_FILE}" -logfile "\${LOG_FILE}"${status_flag}
 EOF
         chmod +x "${BOOT_SCRIPT}"
         echo "Installed Termux boot script at ${BOOT_SCRIPT}"

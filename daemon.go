@@ -422,11 +422,20 @@ func runStatusCmd(args []string) {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
 	mode := fs.String("mode", "connect", "mode to inspect (expose or connect)")
 	pidFile := fs.String("pidfile", envOr("P2PTUN_PIDFILE", ""), "path to pidfile")
-	statusAddr := fs.String("status-addr", envOr("P2PTUN_STATUS_ADDR", ""), "status server address")
+	statusAddr := fs.String("status-addr", envOr("P2PTUN_STATUS_ADDR", envOr("P2PTUN_PANEL_ADDR", envOr("P2PTUN_CONTROL_ADDR", ""))), "status/control panel server address")
+	panelAddr := fs.String("panel-addr", "", "alias for -status-addr")
+	controlAddr := fs.String("control-addr", "", "alias for -status-addr")
 	_ = fs.Parse(args)
 
-	if *statusAddr != "" {
-		urlStr := *statusAddr
+	targetAddr := *statusAddr
+	if targetAddr == "" && *panelAddr != "" {
+		targetAddr = *panelAddr
+	} else if targetAddr == "" && *controlAddr != "" {
+		targetAddr = *controlAddr
+	}
+
+	if targetAddr != "" {
+		urlStr := targetAddr
 		if !strings.HasPrefix(urlStr, "http://") && !strings.HasPrefix(urlStr, "https://") {
 			urlStr = "http://" + urlStr
 		}
@@ -483,8 +492,17 @@ func runStopCmd(args []string) {
 	fs := flag.NewFlagSet("stop", flag.ExitOnError)
 	mode := fs.String("mode", "", "mode to stop (expose or connect)")
 	pidFile := fs.String("pidfile", envOr("P2PTUN_PIDFILE", ""), "path to pidfile")
-	statusAddr := fs.String("status-addr", envOr("P2PTUN_STATUS_ADDR", ""), "optional status server address for graceful /quit")
+	statusAddr := fs.String("status-addr", envOr("P2PTUN_STATUS_ADDR", envOr("P2PTUN_PANEL_ADDR", envOr("P2PTUN_CONTROL_ADDR", ""))), "optional status/control panel server address for graceful /quit")
+	panelAddr := fs.String("panel-addr", "", "alias for -status-addr")
+	controlAddr := fs.String("control-addr", "", "alias for -status-addr")
 	_ = fs.Parse(args)
+
+	targetAddr := *statusAddr
+	if targetAddr == "" && *panelAddr != "" {
+		targetAddr = *panelAddr
+	} else if targetAddr == "" && *controlAddr != "" {
+		targetAddr = *controlAddr
+	}
 
 	type stopTarget struct {
 		pf   string
@@ -519,8 +537,8 @@ func runStopCmd(args []string) {
 			continue
 		}
 		graceful := false
-		if *statusAddr != "" {
-			base := *statusAddr
+		if targetAddr != "" {
+			base := targetAddr
 			if !strings.HasPrefix(base, "http://") && !strings.HasPrefix(base, "https://") {
 				base = "http://" + base
 			}
