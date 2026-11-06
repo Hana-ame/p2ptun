@@ -1,4 +1,4 @@
-# p2ptun (v0.5.1)
+# p2ptun (v0.5.2)
 
 P2P TCP tunnel for remote SSH and TCP proxies, featuring **PeerJS SCTP Control Scheduling + Native ICE UDP Direct Punching (Hysteria 2 / QUIC)** with **Enterprise Multi-Peer Daemonization & Security Hardening**.
 
