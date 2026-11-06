@@ -19,6 +19,7 @@
 - [⚙️ 参数与环境变量全景说明书 (Flags Reference)](#️-参数与环境变量全景说明书-flags-reference)
 - [🛠️ 常驻守护与监控面板 (Daemon & Status)](#️-常驻守护与监控面板-daemon--status)
 - [📡 协议选择与带宽调优指南 (hy2 Brutal CC)](#-协议选择与带宽调优指南-hy2-brutal-cc)
+- [📊 弱网与高丢包实测基准 (Network Impairment Benchmark)](#-弱网与高丢包实测基准-network-impairment-benchmark)
 - [📖 技术架构与深度原理](#-技术架构与深度原理)
 
 ---
@@ -286,9 +287,29 @@ p2ptun expose my-tunnel -secret 123 -status-addr 127.0.0.1:18222 -daemon
 
 ---
 
+## 📊 弱网与高丢包实测基准 (Network Impairment Benchmark)
+
+我们在真实 UDP 传输层注入**网络延迟 (RTT) 与随机丢包**，实测对比 **Hysteria 2 (Brutal CC: 100 Mbps)** 与 **Native QUIC (标准拥塞控制)** 的吞吐量表现（所有场景均执行 100% 逐字节完整性校验）：
+
+| 测试场景 | RTT 时延 | 单向丢包率 | Hysteria 2 (Brutal 100M) | Native QUIC (标准拥塞控制) | Hy2 提速倍率 |
+|---|---|---|---|---|---|
+| **优质局域网 / 专线** | 0 ms | 0 % | **94.12 Mbps** (267 ms) | **107.98 Mbps** (233 ms) | 0.9x |
+| **国内 4G/5G 移动弱网** | 50 ms | 2 % | **48.59 Mbps** (345 ms) | **2.28 Mbps** (7.352 s) | **⚡ 21.3x** |
+| **跨国长途 / 晚高峰海缆** | 100 ms | 5 % | **26.98 Mbps** (622 ms) | **0.69 Mbps** (24.484 s) | **⚡ 39.4x** |
+| **严重拥塞蜂窝网络** | 100 ms | 10 % | **18.07 Mbps** (928 ms) | **0.40 Mbps** (42.227 s) | **⚡ 45.5x** |
+| **极端恶劣弱网链路** | 160 ms | 20 % | **6.09 Mbps** (1.378 s) | **0.12 Mbps** (69.989 s) | **⚡ 50.8x** |
+
+> 💡 **压测结论**：
+> - 传统 TCP / 标准 QUIC 遇到丢包会将拥塞窗口腰斩，在高 RTT 跨国链路上吞吐会崩溃至几十 Kbps；
+> - `p2ptun` 采用 **Hysteria 2 Brutal CC**，不将丢包作为降速信号，按设定带宽恒定步长发包并结合快速 SACK 重传，在 5%~20% 丢包环境下带来 **20 倍到 50 倍的绝对速率优势**。
+> - 完整基准测试分析与本地复现指南详见：[docs/benchmark.md](docs/benchmark.md)。
+
+---
+
 ## 📖 技术架构与深度原理
 
 关于原生 ICE 打洞时序、四阶段握手流程、Brutal 数学模型与故障自愈细节，请参阅：
+- [docs/benchmark.md](docs/benchmark.md)：弱网丢包仿真压测报告与对比数据
 - [docs/architecture.md](docs/architecture.md)：完整技术架构、时序图与并发隔离原理
 - [docs/troubleshooting.md](docs/troubleshooting.md)：常见网络故障与 NAT 穿透诊断手册
 - [examples/](examples/)：systemd 服务模板、环境配置示例与 SSH 配置进阶
