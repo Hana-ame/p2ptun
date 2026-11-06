@@ -2,93 +2,129 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/binary"
 	"encoding/hex"
 	"io"
 	"log"
-	"math/big"
 	"net"
 	"os"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/pion/webrtc/v4"
-	"github.com/quic-go/quic-go"
+	quic "github.com/quic-go/quic-go"
 )
 
 const quicDataChannelLabel = "p2ptun-quic"
 
 // dcPacketConn 将 WebRTC DataChannel (Unordered, MaxRetransmits=0) 适配为 net.PacketConn,
-// 供 quic-go 运行在其上。
+// 供兼容模式 (-proto dc-quic) 及单测运行 quic-go 使用。
 type dcPacketConn struct {
 	dc         *webrtc.DataChannel
 	in         chan []byte
+	lowCh      chan struct{}
 	localAddr  net.Addr
 	remoteAddr net.Addr
 	done       chan struct{}
 	closeOnce  sync.Once
 
-	readDeadline atomic.Value // time.Time
+	deadlineMu  sync.Mutex
+	readDl      time.Time
+	deadlineSig chan struct{}
 }
 
 func newDCPacketConn(dc *webrtc.DataChannel, local, remote net.Addr) *dcPacketConn {
 	c := &dcPacketConn{
-		dc:         dc,
-		in:         make(chan []byte, 4096),
-		localAddr:  local,
-		remoteAddr: remote,
-		done:       make(chan struct{}),
+		dc:          dc,
+		in:          make(chan []byte, 4096),
+		lowCh:       make(chan struct{}, 1),
+		localAddr:   local,
+		remoteAddr:  remote,
+		done:        make(chan struct{}),
+		deadlineSig: make(chan struct{}, 1),
 	}
+	dc.SetBufferedAmountLowThreshold(128 << 10)
+	dc.OnBufferedAmountLow(func() {
+		select {
+		case c.lowCh <- struct{}{}:
+		default:
+		}
+	})
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+		cp := make([]byte, len(msg.Data))
+		copy(cp, msg.Data)
 		select {
 		case <-c.done:
-		case c.in <- msg.Data:
-			globalStats.bytesRx.Add(uint64(len(msg.Data)))
+		case c.in <- cp:
+			globalStats.bytesRx.Add(uint64(len(cp)))
 		default:
-			// 缓冲队列满时丢包（符合 UDP 语义，触发 QUIC 拥塞检测与单流重传）
 		}
 	})
 	dc.OnClose(func() {
+		_ = c.Close()
+	})
+	dc.OnError(func(err error) {
 		_ = c.Close()
 	})
 	return c
 }
 
 func (c *dcPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
-	var timer *time.Timer
-	var timeoutChan <-chan time.Time
-	if dl, ok := c.readDeadline.Load().(time.Time); ok && !dl.IsZero() {
-		dur := time.Until(dl)
-		if dur <= 0 {
-			return 0, nil, os.ErrDeadlineExceeded
-		}
-		timer = time.NewTimer(dur)
-		defer timer.Stop()
-		timeoutChan = timer.C
-	}
+	for {
+		c.deadlineMu.Lock()
+		dl := c.readDl
+		c.deadlineMu.Unlock()
 
-	select {
-	case <-c.done:
-		return 0, nil, io.EOF
-	case <-timeoutChan:
-		return 0, nil, os.ErrDeadlineExceeded
-	case data, ok := <-c.in:
-		if !ok {
-			return 0, nil, io.EOF
+		var timer *time.Timer
+		var timeoutChan <-chan time.Time
+		if !dl.IsZero() {
+			dur := time.Until(dl)
+			if dur <= 0 {
+				return 0, nil, os.ErrDeadlineExceeded
+			}
+			timer = time.NewTimer(dur)
+			timeoutChan = timer.C
 		}
-		n := copy(p, data)
-		return n, c.remoteAddr, nil
+
+		select {
+		case <-c.done:
+			if timer != nil {
+				timer.Stop()
+			}
+			return 0, nil, io.EOF
+		case <-timeoutChan:
+			return 0, nil, os.ErrDeadlineExceeded
+		case <-c.deadlineSig:
+			if timer != nil {
+				timer.Stop()
+			}
+			continue
+		case data, ok := <-c.in:
+			if timer != nil {
+				timer.Stop()
+			}
+			if !ok {
+				return 0, nil, io.EOF
+			}
+			n := copy(p, data)
+			return n, c.remoteAddr, nil
+		}
 	}
 }
 
 func (c *dcPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	for c.dc.BufferedAmount() > (512 << 10) {
+		select {
+		case <-c.done:
+			return 0, io.EOF
+		case <-c.lowCh:
+		case <-time.After(15 * time.Millisecond):
+			break
+		}
+		break
+	}
 	select {
 	case <-c.done:
 		return 0, io.EOF
@@ -112,12 +148,17 @@ func (c *dcPacketConn) Close() error {
 func (c *dcPacketConn) LocalAddr() net.Addr { return c.localAddr }
 
 func (c *dcPacketConn) SetDeadline(t time.Time) error {
-	c.readDeadline.Store(t)
-	return nil
+	return c.SetReadDeadline(t)
 }
 
 func (c *dcPacketConn) SetReadDeadline(t time.Time) error {
-	c.readDeadline.Store(t)
+	c.deadlineMu.Lock()
+	c.readDl = t
+	c.deadlineMu.Unlock()
+	select {
+	case c.deadlineSig <- struct{}{}:
+	default:
+	}
 	return nil
 }
 
@@ -131,26 +172,11 @@ func quicSecretALPN(secret string) string {
 }
 
 func generateQUICServerTLS(secret string) (*tls.Config, error) {
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		return nil, err
-	}
-	template := x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "p2ptun"},
-		NotBefore:    time.Now().Add(-1 * time.Hour),
-		NotAfter:     time.Now().Add(365 * 24 * time.Hour),
-	}
-	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
-	if err != nil {
-		return nil, err
-	}
-	cert := tls.Certificate{
-		Certificate: [][]byte{certDER},
-		PrivateKey:  key,
+	if globalECDSACertErr != nil {
+		return nil, globalECDSACertErr
 	}
 	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
+		Certificates: []tls.Certificate{globalECDSACert},
 		NextProtos:   []string{quicSecretALPN(secret)},
 	}, nil
 }
@@ -168,42 +194,24 @@ func defaultQUICConfig() *quic.Config {
 		KeepAlivePeriod:                10 * time.Second,
 		DisablePathMTUDiscovery:        true,
 		InitialPacketSize:              1200,
-		MaxIncomingStreams:             2000,
-		InitialStreamReceiveWindow:     4 << 20, // 4MB
+		MaxIncomingStreams:             1000,
+		InitialStreamReceiveWindow:     4 << 20,  // 4MB
 		MaxStreamReceiveWindow:         16 << 20, // 16MB
-		InitialConnectionReceiveWindow: 8 << 20, // 8MB
-		MaxConnectionReceiveWindow:     64 << 20, // 64MB
+		InitialConnectionReceiveWindow: 8 << 20,  // 8MB
+		MaxConnectionReceiveWindow:     32 << 20, // 32MB
 		EnableDatagrams:                true,
 	}
 }
 
-// pipeStream pipes a TCP connection and a QUIC stream bidirectionally.
-func pipeStream(tcpConn net.Conn, qStream quic.Stream) {
+// pipeStream pipes a TCP connection and a QUIC stream bidirectionally (compatible with quic-go v0.59.0 *quic.Stream).
+func pipeStream(tcpConn net.Conn, qStream *quic.Stream) {
 	tuneTCPConn(tcpConn)
 	defer tcpConn.Close()
 	defer qStream.Close()
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
-		_, _ = io.Copy(qStream, tcpConn)
-		_ = qStream.Close() // 发送 QUIC STREAM FIN，通知对端本端已发送完毕
-	}()
-
-	go func() {
-		defer wg.Done()
-		_, _ = io.Copy(tcpConn, qStream)
-		if cw, ok := tcpConn.(interface{ CloseWrite() error }); ok {
-			_ = cw.CloseWrite()
-		}
-	}()
-
-	wg.Wait()
+	pipeBidirectional(tcpConn, qStream, nil)
 }
 
-// runQUICExpose runs the QUIC server on the expose side over the given DataChannel.
+// runQUICExpose runs the QUIC server on the expose side over the given DataChannel (-proto dc-quic compatibility).
 func runQUICExpose(cfg config, sess *exposeSession, dc *webrtc.DataChannel) {
 	defer sess.close()
 
@@ -241,8 +249,7 @@ func runQUICExpose(cfg config, sess *exposeSession, dc *webrtc.DataChannel) {
 		}
 		log.Printf("expose: [%s] quic connection established with client", sess.key)
 
-		// RFC 9221 datagram echo loop for RTT measurement
-		go func(conn quic.Connection) {
+		go func(conn *quic.Conn) {
 			for {
 				msg, err := conn.ReceiveDatagram(sess.ctx)
 				if err != nil {
@@ -252,7 +259,7 @@ func runQUICExpose(cfg config, sess *exposeSession, dc *webrtc.DataChannel) {
 			}
 		}(qConn)
 
-		go func(conn quic.Connection) {
+		go func(conn *quic.Conn) {
 			defer conn.CloseWithError(0, "session closed")
 			for {
 				stream, err := conn.AcceptStream(sess.ctx)
@@ -260,7 +267,7 @@ func runQUICExpose(cfg config, sess *exposeSession, dc *webrtc.DataChannel) {
 					return
 				}
 				globalStats.activeStreams.Add(1)
-				go func(st quic.Stream) {
+				go func(st *quic.Stream) {
 					defer globalStats.activeStreams.Add(-1)
 					dialCtx, cancel := context.WithTimeout(sess.ctx, 5*time.Second)
 					targetConn, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", cfg.target)
@@ -277,7 +284,7 @@ func runQUICExpose(cfg config, sess *exposeSession, dc *webrtc.DataChannel) {
 	}
 }
 
-// runQUICConnect runs the QUIC client on the connect side over the given DataChannel.
+// runQUICConnect runs the QUIC client on the connect side over the given DataChannel (-proto dc-quic compatibility).
 func runQUICConnect(s *tunnelSess, dc *webrtc.DataChannel) {
 	cAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 4431}
 	sAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 4430}
@@ -305,9 +312,9 @@ func runQUICConnect(s *tunnelSess, dc *webrtc.DataChannel) {
 	s.quicMu.Lock()
 	s.quicConn = qConn
 	s.quicMu.Unlock()
+	s.wasReady.Store(true)
 	s.readyOnce.Do(func() { close(s.trReady) })
 
-	// RFC 9221 datagram RTT probe loop
 	go func() {
 		interval := s.cfg.keepalive
 		if interval <= 0 {

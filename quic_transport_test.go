@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -13,7 +14,6 @@ import (
 )
 
 func TestQUICOverDataChannelDirect(t *testing.T) {
-	// 1. 模拟目标 TCP 服务端 (Echo Server)
 	echoLis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("echo listen: %v", err)
@@ -33,7 +33,6 @@ func TestQUICOverDataChannelDirect(t *testing.T) {
 		}
 	}()
 
-	// 2. 创建直连的 WebRTC PeerConnection 对 (无需真实公网信令)
 	m := webrtc.MediaEngine{}
 	api := webrtc.NewAPI(webrtc.WithMediaEngine(&m))
 
@@ -49,7 +48,6 @@ func TestQUICOverDataChannelDirect(t *testing.T) {
 	}
 	defer pcClient.Close()
 
-	// 交换 ICE Candidates
 	pcServer.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c != nil {
 			_ = pcClient.AddICECandidate(c.ToJSON())
@@ -65,7 +63,6 @@ func TestQUICOverDataChannelDirect(t *testing.T) {
 	clientDone := make(chan struct{})
 	secret := "test-secret-1234"
 
-	// 3. 服务端等待 DataChannel 并启动 runQUICExpose
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -86,7 +83,6 @@ func TestQUICOverDataChannelDirect(t *testing.T) {
 		})
 	})
 
-	// 4. 客户端创建 Unordered Unreliable DataChannel
 	ordered := false
 	maxRetr := uint16(0)
 	dcClient, err := pcClient.CreateDataChannel(quicDataChannelLabel, &webrtc.DataChannelInit{
@@ -109,7 +105,6 @@ func TestQUICOverDataChannelDirect(t *testing.T) {
 		go runQUICConnect(tunSess, dcClient)
 	})
 
-	// SDP 握手
 	offer, err := pcClient.CreateOffer(nil)
 	if err != nil {
 		t.Fatalf("create offer: %v", err)
@@ -124,14 +119,12 @@ func TestQUICOverDataChannelDirect(t *testing.T) {
 	_ = pcServer.SetLocalDescription(answer)
 	_ = pcClient.SetRemoteDescription(answer)
 
-	// 等待 QUIC 握手就绪
 	select {
 	case <-tunSess.trReady:
 	case <-time.After(10 * time.Second):
 		t.Fatalf("quic tunnel not ready after 10s")
 	}
 
-	// 5. 模拟 10 个并发 TCP 连接通过 QUIC 流进行传输
 	var wg sync.WaitGroup
 	for i := 0; i < 10; i++ {
 		wg.Add(1)
@@ -151,20 +144,20 @@ func TestQUICOverDataChannelDirect(t *testing.T) {
 			}
 			defer st.Close()
 
-			msg := fmt.Sprintf("quic-packet-stream-payload-test-%d", streamIdx)
-			if _, err := st.Write([]byte(msg)); err != nil {
+			msg := []byte(fmt.Sprintf("quic-packet-stream-payload-test-%d", streamIdx))
+			if _, err := st.Write(msg); err != nil {
 				t.Errorf("stream write: %v", err)
 				return
 			}
-			_ = st.Close() // 发送 FIN
+			_ = st.Close()
 
 			buf := make([]byte, len(msg))
 			if _, err := io.ReadFull(st, buf); err != nil {
 				t.Errorf("stream read: %v", err)
 				return
 			}
-			if string(buf) != msg {
-				t.Errorf("mismatch: got %s, want %s", string(buf), msg)
+			if !bytes.Equal(buf, msg) {
+				t.Errorf("mismatch: got %s, want %s", string(buf), string(msg))
 			}
 		}(i)
 	}

@@ -442,6 +442,8 @@ func tuneTCPConn(c net.Conn) {
 		_ = tc.SetNoDelay(true)
 		_ = tc.SetKeepAlive(true)
 		_ = tc.SetKeepAlivePeriod(30 * time.Second)
+		_ = tc.SetReadBuffer(1024 * 1024)
+		_ = tc.SetWriteBuffer(1024 * 1024)
 	}
 }
 

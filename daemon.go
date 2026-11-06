@@ -27,6 +27,8 @@ type runtimeStats struct {
 	remotePeer    string
 	targetOrLis   string
 	currentBroker atomic.Value // string
+	transportMode atomic.Value // string ("hy2" | "quic" | "classic" | "dc-quic")
+	udpEndpoint   atomic.Value // string (remote native UDP ip:port)
 	signalingUp   atomic.Bool
 	activePeers   atomic.Int64
 	activeStreams atomic.Int64
@@ -47,6 +49,15 @@ var globalStats = &runtimeStats{
 func (s *runtimeStats) setError(err error) {
 	if err != nil {
 		s.lastError.Store(fmt.Sprintf("%s (%s)", err.Error(), time.Now().Format("15:04:05")))
+	}
+}
+
+func (s *runtimeStats) setTransport(mode, udpEp string) {
+	if mode != "" {
+		s.transportMode.Store(mode)
+	}
+	if udpEp != "" {
+		s.udpEndpoint.Store(udpEp)
 	}
 }
 
@@ -72,6 +83,8 @@ type statusSnapshot struct {
 	PeerID        string `json:"peer_id"`
 	RemotePeer    string `json:"remote_peer,omitempty"`
 	Endpoint      string `json:"endpoint"`
+	Proto         string `json:"proto,omitempty"`
+	UDPEndpoint   string `json:"udp_endpoint,omitempty"`
 	Broker        string `json:"broker"`
 	UptimeSec     int64  `json:"uptime_sec"`
 	Uptime        string `json:"uptime"`
@@ -88,6 +101,8 @@ type statusSnapshot struct {
 
 func (s *runtimeStats) snapshot() statusSnapshot {
 	broker, _ := s.currentBroker.Load().(string)
+	trMode, _ := s.transportMode.Load().(string)
+	udpEp, _ := s.udpEndpoint.Load().(string)
 	lastErr, _ := s.lastError.Load().(string)
 	up := time.Since(s.startTime).Round(time.Second)
 	return statusSnapshot{
@@ -97,6 +112,8 @@ func (s *runtimeStats) snapshot() statusSnapshot {
 		PeerID:        s.peerID,
 		RemotePeer:    s.remotePeer,
 		Endpoint:      s.targetOrLis,
+		Proto:         trMode,
+		UDPEndpoint:   udpEp,
 		Broker:        broker,
 		UptimeSec:     int64(up.Seconds()),
 		Uptime:        up.String(),
@@ -256,9 +273,6 @@ func maybeDaemonize(cfg *config) (*rotatingFileWriter, func(), error) {
 		}
 		cmd := exec.Command(exe, scrubSecretArgs(os.Args[1:])...)
 		cmd.Env = daemonChildEnv(cfg.secret)
-		// 子进程自己会用 rotatingFileWriter 打开日志并轮转; 这里不能再把
-		// 同一个文件的句柄交给它的 stdout/stderr, 否则轮转 rename 后
-		// stderr 仍指向旧 inode (Windows 上还会因共享冲突导致 rename 失败).
 		devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
 		if err != nil {
 			return nil, nil, fmt.Errorf("open %s: %w", os.DevNull, err)
@@ -329,7 +343,6 @@ func crossSiteRequest(r *http.Request) bool {
 }
 
 // startStatusServer 启动可选的本地 HTTP 状态与控制接口 (-status-addr 127.0.0.1:18222)
-// 端口无默认值 (空=不监听); 示例避开 9222/9223 (Chromium CDP) 与 9229 (Node inspector).
 func startStatusServer(addr string, stop <-chan struct{}, quit func()) (net.Listener, error) {
 	if addr == "" {
 		return nil, nil
@@ -339,13 +352,6 @@ func startStatusServer(addr string, stop <-chan struct{}, quit func()) (net.List
 		return nil, err
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			http.NotFound(w, r)
-			return
-		}
-		http.Redirect(w, r, "/status", http.StatusTemporaryRedirect)
-	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		snap := globalStats.snapshot()
 		w.Header().Set("Content-Type", "application/json")
@@ -363,9 +369,6 @@ func startStatusServer(addr string, stop <-chan struct{}, quit func()) (net.List
 		_ = enc.Encode(globalStats.snapshot())
 	})
 	mux.HandleFunc("/reconnect", func(w http.ResponseWriter, r *http.Request) {
-		// 状态接口是本地控制面: 只接受 POST, 且拒绝浏览器跨站请求.
-		// 否则任意网页可用 <img src="http://127.0.0.1:18222/reconnect">
-		// (或自动提交表单) 持续触发断线重连, 构成 CSRF DoS.
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", http.MethodPost)
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -380,8 +383,6 @@ func startStatusServer(addr string, stop <-chan struct{}, quit func()) (net.List
 		_, _ = w.Write([]byte(`{"ok":true,"action":"reconnect_triggered"}` + "\n"))
 	})
 	mux.HandleFunc("/quit", func(w http.ResponseWriter, r *http.Request) {
-		// 优雅停止端点: Windows 不支持给非子进程发信号, `p2ptun stop`
-		// 需要靠它触发 SIGTERM 等价的退出流程 (SIGTERM 父进程仍可用 kill).
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", http.MethodPost)
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -440,7 +441,6 @@ func runStatusCmd(args []string) {
 		}
 	}
 
-	// 检查 pidfile 与 log
 	for _, m := range []string{*mode, "expose", "connect"} {
 		pf := *pidFile
 		lf := ""
@@ -514,12 +514,10 @@ func runStopCmd(args []string) {
 			continue
 		}
 		if !isP2ptunProcess(pid, tgt.mode) {
-			// pidfile 是旧的/被别的进程复用了: 只清理文件, 绝不向该 PID 发信号.
 			fmt.Printf("p2ptun: refusing to stop pid=%d (%s): not a p2ptun process (stale pidfile)\n", pid, tgt.pf)
 			_ = os.Remove(tgt.pf)
 			continue
 		}
-		// 1) 优先走 status server 的 /quit (跨平台, Windows 上 os.Interrupt 不可用).
 		graceful := false
 		if *statusAddr != "" {
 			base := *statusAddr
@@ -534,13 +532,11 @@ func runStopCmd(args []string) {
 				}
 			}
 		}
-		// 2) Unix 上直接发 SIGINT (p2ptun 自己处理); Windows 上该调用会失败, 忽略.
 		if !graceful {
 			if proc, perr := os.FindProcess(pid); perr == nil {
 				_ = proc.Signal(os.Interrupt)
 			}
 		}
-		// 3) 轮询 pidfile: 进程优雅退出时 cleanup 会删除 pidfile; 最多等 3s.
 		exited := false
 		deadline := time.Now().Add(3 * time.Second)
 		for time.Now().Before(deadline) {
@@ -551,7 +547,6 @@ func runStopCmd(args []string) {
 			time.Sleep(100 * time.Millisecond)
 		}
 		if !exited {
-			// 4) 超时才硬杀, 避免像旧版那样 300ms 就 SIGKILL 导致 LEAVE 发不出去.
 			if proc, perr := os.FindProcess(pid); perr == nil {
 				_ = proc.Kill()
 			}
@@ -630,6 +625,7 @@ command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock
 export P2PTUN_PEER="${P2PTUN_PEER:-wslssh-a1b2}"
 export P2PTUN_SECRET="${P2PTUN_SECRET:-hunter2}"
 export P2PTUN_LISTEN="${P2PTUN_LISTEN:-127.0.0.1:2222}"
+export P2PTUN_PROTO="${P2PTUN_PROTO:-hy2}"
 
 exec p2ptun %s -daemon
 `, mode)

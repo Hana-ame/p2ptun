@@ -7,7 +7,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"math/big"
 	"net"
@@ -23,11 +22,11 @@ import (
 
 	hyClient "github.com/apernet/hysteria/core/v2/client"
 	"github.com/pion/webrtc/v4"
-	"github.com/quic-go/quic-go"
+	quic "github.com/quic-go/quic-go"
 )
 
 const (
-	version = "0.4.0"
+	version = "0.2.2"
 
 	defaultBroker = "wss://0.peerjs.com,wss://1.peerjs.com"
 	defaultKey    = "peerjs"
@@ -64,13 +63,13 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `p2ptun %s - P2P TCP tunnel over PeerJS signaling + WebRTC DataChannel
+	fmt.Fprintf(os.Stderr, `p2ptun %s - P2P TCP tunnel over PeerJS SCTP scheduling + Native UDP (Hysteria 2 / QUIC)
 
 expose   (run where the TCP service lives, e.g. WSL / Linux server):
-  p2ptun expose -secret SECRET [-id MYID] [-target 127.0.0.1:22] [-daemon]
+  p2ptun expose -secret SECRET [-id MYID] [-target 127.0.0.1:22] [-proto hy2|quic|classic] [-bandwidth 50] [-daemon]
 
 connect  (run on the remote client side, e.g. Termux / laptop):
-  p2ptun connect -peer REMOTE_ID -secret SECRET [-listen 127.0.0.1:2222] [-daemon]
+  p2ptun connect -peer REMOTE_ID -secret SECRET [-listen 127.0.0.1:2222] [-proto hy2|quic|classic] [-bandwidth 50] [-daemon]
 
 daemon & management commands:
   p2ptun status  [-mode expose|connect] [-status-addr 127.0.0.1:18222]
@@ -83,6 +82,8 @@ common flags (env fallbacks in parens):
   -secret S         pairing secret, must match both sides  (P2PTUN_SECRET)
   -target H:P       exposed TCP endpoint (expose)          (P2PTUN_TARGET=127.0.0.1:22)
   -listen H:P       local listen addr (connect)            (P2PTUN_LISTEN=127.0.0.1:2222)
+  -proto P          transport protocol: hy2, quic, classic (P2PTUN_PROTO=hy2)
+  -bandwidth MB     Brutal CC target bandwidth in Mbps     (P2PTUN_BANDWIDTH=50)
   -broker CSV       signaling brokers, comma-separated     (P2PTUN_BROKER=%s)
   -key K            PeerJS api key                         (P2PTUN_KEY=peerjs)
   -stun CSV         STUN servers, comma-separated          (P2PTUN_STUN)
@@ -92,7 +93,7 @@ common flags (env fallbacks in parens):
   -nat1to1 IP       advertise external 1:1 NAT IP          (P2PTUN_NAT1TO1)
   -proxy URL        HTTP/HTTPS proxy for signaling WS      (P2PTUN_PROXY)
   -keep-proxy       keep system HTTP_PROXY for signaling   (P2PTUN_KEEP_PROXY)
-  -keepalive DUR    DataChannel ping interval (default 10s)(P2PTUN_KEEPALIVE)
+  -keepalive DUR    tunnel ping interval (default 10s)     (P2PTUN_KEEPALIVE)
   -max-peers N      max concurrent peers on expose (16)    (P2PTUN_MAX_PEERS)
   -on-demand        connect only when local TCP connects   (P2PTUN_ON_DEMAND)
   -idle-timeout DUR close idle on-demand tunnel (10m)      (P2PTUN_IDLE_TIMEOUT)
@@ -104,35 +105,45 @@ common flags (env fallbacks in parens):
 }
 
 type config struct {
-	mode        string
-	id          string
-	idExplicit  bool
-	peer        string
-	secret      string
-	target      string
-	listen      string
-	broker      string
-	brokers     []string
-	key         string
-	stun        []string
-	turn        []string
-	forceRelay  bool
-	icePorts    string
-	nat1to1     []string
-	proxy       string
-	keepProxy   bool
-	keepalive   time.Duration
-	maxPeers    int
-	onDemand    bool
-	idleTimeout time.Duration
-	daemon      bool
-	pidFile     string
-	logFile     string
-	logMaxMB    int
+	mode          string
+	id            string
+	idExplicit    bool
+	peer          string
+	secret        string
+	target        string
+	listen        string
+	broker        string
+	brokers       []string
+	key           string
+	stun          []string
+	turn          []string
+	forceRelay    bool
+	icePorts      string
+	nat1to1       []string
+	proxy         string
+	keepProxy     bool
+	keepalive     time.Duration
+	maxPeers      int
+	onDemand      bool
+	idleTimeout   time.Duration
+	daemon        bool
+	pidFile       string
+	logFile       string
+	logMaxMB      int
 	statusAddr    string
-	useQUIC       bool
 	proto         string
 	bandwidthMbps int
+	useQUIC       bool
+}
+
+func (c config) effectiveProto() string {
+	if c.proto != "" {
+		return normalizeProto(c.proto)
+	}
+	if c.useQUIC {
+		return "dc-quic"
+	}
+	return "classic"
 }
 
 func envOr(key, def string) string {
@@ -175,34 +186,35 @@ func envDuration(key string, def time.Duration) time.Duration {
 
 func parseConfig(args []string, mode string) (config, error) {
 	fs := flag.NewFlagSet(mode, flag.ContinueOnError)
+	defProto := envOr("P2PTUN_PROTO", envOr("P2PTUN_TRANSPORT", "hy2"))
 	cfg := config{
-		mode:        mode,
-		id:          envOr("P2PTUN_ID", ""),
-		peer:        envOr("P2PTUN_PEER", ""),
-		secret:      envOr("P2PTUN_SECRET", ""),
-		target:      envOr("P2PTUN_TARGET", "127.0.0.1:22"),
-		listen:      envOr("P2PTUN_LISTEN", "127.0.0.1:2222"),
-		broker:      envOr("P2PTUN_BROKER", defaultBroker),
-		key:         envOr("P2PTUN_KEY", defaultKey),
-		stun:        splitCSV(envOr("P2PTUN_STUN", defaultSTUN)),
-		turn:        splitCSV(envOr("P2PTUN_TURN", "")),
-		forceRelay:  envBool("P2PTUN_FORCE_RELAY"),
-		icePorts:    envOr("P2PTUN_ICE_PORTS", ""),
-		nat1to1:     splitCSV(envOr("P2PTUN_NAT1TO1", "")),
-		proxy:       envOr("P2PTUN_PROXY", ""),
-		keepProxy:   envBool("P2PTUN_KEEP_PROXY"),
-		keepalive:   envDuration("P2PTUN_KEEPALIVE", 10*time.Second),
-		maxPeers:    envInt("P2PTUN_MAX_PEERS", 16),
-		onDemand:    envBool("P2PTUN_ON_DEMAND"),
-		idleTimeout: envDuration("P2PTUN_IDLE_TIMEOUT", 10*time.Minute),
-		daemon:      envBool("P2PTUN_DAEMON"),
-		pidFile:     envOr("P2PTUN_PIDFILE", ""),
-		logFile:     envOr("P2PTUN_LOGFILE", ""),
-		logMaxMB:    envInt("P2PTUN_LOG_MAX_MB", 10),
+		mode:          mode,
+		id:            envOr("P2PTUN_ID", ""),
+		peer:          envOr("P2PTUN_PEER", ""),
+		secret:        envOr("P2PTUN_SECRET", ""),
+		target:        envOr("P2PTUN_TARGET", "127.0.0.1:22"),
+		listen:        envOr("P2PTUN_LISTEN", "127.0.0.1:2222"),
+		broker:        envOr("P2PTUN_BROKER", defaultBroker),
+		key:           envOr("P2PTUN_KEY", defaultKey),
+		stun:          splitCSV(envOr("P2PTUN_STUN", defaultSTUN)),
+		turn:          splitCSV(envOr("P2PTUN_TURN", "")),
+		forceRelay:    envBool("P2PTUN_FORCE_RELAY"),
+		icePorts:      envOr("P2PTUN_ICE_PORTS", ""),
+		nat1to1:       splitCSV(envOr("P2PTUN_NAT1TO1", "")),
+		proxy:         envOr("P2PTUN_PROXY", ""),
+		keepProxy:     envBool("P2PTUN_KEEP_PROXY"),
+		keepalive:     envDuration("P2PTUN_KEEPALIVE", 10*time.Second),
+		maxPeers:      envInt("P2PTUN_MAX_PEERS", 16),
+		onDemand:      envBool("P2PTUN_ON_DEMAND"),
+		idleTimeout:   envDuration("P2PTUN_IDLE_TIMEOUT", 10*time.Minute),
+		daemon:        envBool("P2PTUN_DAEMON"),
+		pidFile:       envOr("P2PTUN_PIDFILE", ""),
+		logFile:       envOr("P2PTUN_LOGFILE", ""),
+		logMaxMB:      envInt("P2PTUN_LOG_MAX_MB", 10),
 		statusAddr:    envOr("P2PTUN_STATUS_ADDR", ""),
-		useQUIC:       envBoolDefault("P2PTUN_QUIC", true),
-		proto:         envOr("P2PTUN_PROTO", "hy2"),
+		proto:         defProto,
 		bandwidthMbps: envInt("P2PTUN_BANDWIDTH", 50),
+		useQUIC:       envBoolDefault("P2PTUN_QUIC", true),
 	}
 	fs.StringVar(&cfg.id, "id", cfg.id, "peer id")
 	fs.StringVar(&cfg.peer, "peer", cfg.peer, "remote peer id (connect)")
@@ -211,6 +223,10 @@ func parseConfig(args []string, mode string) (config, error) {
 	fs.StringVar(&cfg.listen, "listen", cfg.listen, "local listen addr (connect)")
 	fs.StringVar(&cfg.broker, "broker", cfg.broker, "signaling broker URL(s), comma separated")
 	fs.StringVar(&cfg.key, "key", cfg.key, "PeerJS api key")
+	fs.StringVar(&cfg.proto, "proto", cfg.proto, "transport protocol: hy2 (default), quic, classic")
+	transportAlias := ""
+	fs.StringVar(&transportAlias, "transport", "", "alias for -proto (hy2, quic, classic)")
+	fs.IntVar(&cfg.bandwidthMbps, "bandwidth", cfg.bandwidthMbps, "target bandwidth in Mbps for Hysteria 2 Brutal CC")
 	stun := ""
 	fs.StringVar(&stun, "stun", "", "STUN servers, comma separated")
 	turn := ""
@@ -231,19 +247,18 @@ func parseConfig(args []string, mode string) (config, error) {
 	fs.StringVar(&cfg.logFile, "logfile", cfg.logFile, "rotating log file path")
 	fs.IntVar(&cfg.logMaxMB, "log-max-mb", cfg.logMaxMB, "max log file size in MB before rotation")
 	fs.StringVar(&cfg.statusAddr, "status-addr", cfg.statusAddr, "local HTTP status server address")
-	fs.BoolVar(&cfg.useQUIC, "quic", cfg.useQUIC, "use QUIC over WebRTC DataChannel")
-	fs.StringVar(&cfg.proto, "proto", cfg.proto, "transport protocol: hy2 (Hysteria2 Brutal, default), quic, or classic")
-	fs.IntVar(&cfg.bandwidthMbps, "bandwidth", cfg.bandwidthMbps, "target bandwidth in Mbps for Hysteria2 Brutal CC (default 50)")
+	fs.BoolVar(&cfg.useQUIC, "quic", cfg.useQUIC, "use QUIC/Hysteria2 transport (set -quic=false for classic)")
 
 	if err := fs.Parse(args); err != nil {
 		return cfg, err
 	}
-	cfg.proto = strings.ToLower(strings.TrimSpace(cfg.proto))
-	if !cfg.useQUIC && cfg.proto != "hy2" {
-		cfg.proto = "classic"
+
+	if transportAlias != "" {
+		cfg.proto = transportAlias
 	}
-	if cfg.bandwidthMbps <= 0 {
-		cfg.bandwidthMbps = 50
+	cfg.proto = normalizeProto(cfg.proto)
+	if !cfg.useQUIC {
+		cfg.proto = "classic"
 	}
 
 	if stun != "" {
@@ -274,6 +289,9 @@ func parseConfig(args []string, mode string) (config, error) {
 	}
 	if cfg.maxPeers <= 0 {
 		cfg.maxPeers = 16
+	}
+	if cfg.bandwidthMbps <= 0 {
+		cfg.bandwidthMbps = 50
 	}
 
 	configuredProxy.Store(&cfg.proxy)
@@ -359,11 +377,7 @@ func (c config) iceServers() []webrtc.ICEServer {
 // newPeerConn 使用 SettingEngine 构建针对多网络环境优化的 PeerConnection
 func (c config) newPeerConn() (*webrtc.PeerConnection, error) {
 	se := webrtc.SettingEngine{}
-	// 放宽短暂断连容忍度 (10s disconnected -> 25s failed, 2s ICE keepalive),
-	// 避免手机基站切换或瞬间丢包导致连接误断, 同时结合 DataChannel ping 快速识别真正断网
 	se.SetICETimeouts(10*time.Second, 25*time.Second, 2*time.Second)
-	// 扩大 SCTP 接收缓冲区至 16MB (默认仅 1MB), 避免高 RTT 跨洋链路下 BDP 瓶颈限速
-	se.SetSCTPMaxReceiveBufferSize(16 * 1024 * 1024)
 
 	if c.icePorts != "" {
 		parts := strings.Split(c.icePorts, "-")
@@ -397,7 +411,6 @@ func randHex(n int) string {
 	return hex.EncodeToString(b)
 }
 
-// backoffDelay 计算带随机抖动的指数退避等待时间, 兼顾快速恢复与省电防封
 func backoffDelay(attempt int, base, max time.Duration) time.Duration {
 	if attempt <= 0 {
 		return base
@@ -410,7 +423,6 @@ func backoffDelay(attempt int, base, max time.Duration) time.Duration {
 	if d > max {
 		d = max
 	}
-	// +0~25% 随机抖动
 	if jitterMax := int64(d / 4); jitterMax > 0 {
 		if n, err := rand.Int(rand.Reader, big.NewInt(jitterMax)); err == nil {
 			d += time.Duration(n.Int64())
@@ -419,7 +431,6 @@ func backoffDelay(attempt int, base, max time.Duration) time.Duration {
 	return d
 }
 
-// sleepOrStop 等待 d 或在 stop 关闭时立即唤醒返回 false
 func sleepOrStop(d time.Duration, stop <-chan struct{}) bool {
 	if d <= 0 {
 		select {
@@ -524,7 +535,7 @@ func u16(p *uint16) uint16 {
 
 // ============================================================================
 // expose (runs next to the TCP service, supports persistent signaling +
-//         concurrent multi-peer sessions + zero-stall instant reconnection)
+//         concurrent multi-peer sessions + Native UDP Hysteria2 / QUIC)
 // ============================================================================
 
 func runExpose(args []string) {
@@ -550,6 +561,7 @@ func runExpose(args []string) {
 	globalStats.mode = "expose"
 	globalStats.peerID = cfg.id
 	globalStats.targetOrLis = cfg.target
+	globalStats.setTransport(cfg.effectiveProto(), "")
 	globalStats.setTriggerReconnect(mgr.forceSignalingReconnect)
 
 	if cfg.statusAddr != "" {
@@ -579,7 +591,7 @@ func runExpose(args []string) {
 	mgr.run()
 }
 
-// exposeSession 代表来自某个远端客户端的一条独立 WebRTC 隧道会话
+// exposeSession 代表来自某个远端客户端的一条独立隧道会话
 type exposeSession struct {
 	key      string
 	peer     string
@@ -603,14 +615,14 @@ func (es *exposeSession) close() {
 	es.once.Do(func() {
 		es.closed.Store(true)
 		if es.cancel != nil {
-			es.cancel() // 取消该会话内所有挂起的拨号
+			es.cancel()
 		}
 		close(es.done)
 		es.trMu.Lock()
 		tr := es.tr
 		es.trMu.Unlock()
 		if tr != nil {
-			tr.closeNoNotify() // 防止 sync.Once 重入死锁 (close() 是 transport 的 onClose)
+			tr.closeNoNotify()
 		}
 		if es.reg != nil {
 			es.reg.closeAll()
@@ -679,7 +691,6 @@ func (m *exposeManager) closeAllSessions(notifyLeave bool) {
 	}
 }
 
-// removeSession 只删除"自己"这个会话: 迟到的旧会话回调不会误删同 key 的新会话。
 func (m *exposeManager) removeSession(sess *exposeSession) {
 	m.mu.Lock()
 	if cur, ok := m.sessions[sess.key]; ok && cur == sess {
@@ -691,8 +702,8 @@ func (m *exposeManager) removeSession(sess *exposeSession) {
 }
 
 func (m *exposeManager) run() {
-	log.Printf("expose: id=%s target=%s brokers=%s max-peers=%d secret=***",
-		m.cfg.id, m.cfg.target, strings.Join(m.cfg.brokers, ","), m.cfg.maxPeers)
+	log.Printf("expose: id=%s target=%s proto=%s bandwidth=%dMbps brokers=%s max-peers=%d secret=***",
+		m.cfg.id, m.cfg.target, m.cfg.effectiveProto(), m.cfg.bandwidthMbps, strings.Join(m.cfg.brokers, ","), m.cfg.maxPeers)
 	defer m.closeAllSessions(true)
 
 	attempt := 0
@@ -716,14 +727,12 @@ func (m *exposeManager) run() {
 		default:
 		}
 
-		// 若稳定运行了超过 30 秒后断开, 重置退避计数立即重连
 		if time.Since(started) > 30*time.Second {
 			attempt = 0
 		}
 
 		wait := backoffDelay(attempt, 1*time.Second, 15*time.Second)
 		if errors.Is(err, errIDTaken) {
-			// PeerJS 云服务器在异常断网后可能残留旧 WebSocket 约 10~30s, 退避等待服务端清理
 			wait = backoffDelay(attempt+2, 2*time.Second, 20*time.Second)
 		}
 		attempt++
@@ -744,7 +753,6 @@ func (m *exposeManager) runSignalingLoop() error {
 	token := randHex(12)
 	sigLost := make(chan error, 1)
 
-	// 信令握手也要响应 stop: 停止服务时不必等 websocket/代理超时.
 	ctx, cancel := contextWithStops(m.stop, nil)
 	defer cancel()
 
@@ -783,10 +791,8 @@ func (m *exposeManager) runSignalingLoop() error {
 	globalStats.signalingUp.Store(true)
 	globalStats.currentBroker.Store(sc.broker)
 	log.Printf("expose: signaling ready id=%s broker=%s", m.cfg.id, sc.broker)
-	// 配对密钥绝不能进日志: 日志默认落在 ~/.p2ptun/, 历史版本还是 0644 可读.
-	// 这里只打印可直接复制的命令骨架, 密钥由使用者自行填入.
-	log.Printf("expose: connect side command: p2ptun connect -peer %s -secret <SECRET> -listen 127.0.0.1:2222",
-		m.cfg.id)
+	log.Printf("expose: connect side command: p2ptun connect -peer %s -secret <SECRET> -listen 127.0.0.1:2222 -proto %s -bandwidth %d",
+		m.cfg.id, m.cfg.effectiveProto(), m.cfg.bandwidthMbps)
 
 	select {
 	case <-m.stop:
@@ -814,7 +820,6 @@ func (m *exposeManager) findSession(peer, connID string) *exposeSession {
 			return s
 		}
 	}
-	// 兼容未带 connID 的候选帧: 若该 peer 只有一个活跃会话则匹配它
 	var match *exposeSession
 	for _, s := range m.sessions {
 		if s.peer == peer {
@@ -852,13 +857,9 @@ func (m *exposeManager) handleSignal(typ, src string, sig pjSignal) {
 	}
 }
 
-// acceptOffer 为每次新 OFFER 立即创建全新独立的 PeerConnection:
-//   - 彻底解决原版 "busy pc=.., restarting session" 丢弃新 OFFER 并重启整个信令导致的 18s+ 卡死;
-//   - 支持同一客户端无缝秒级重连, 以及多个不同客户端同时并发连接!
 func (m *exposeManager) acceptOffer(src string, sig pjSignal) {
 	key := sessionKey(src, sig.ConnectionID)
 
-	// 清理同一 (src, connID) 的旧会话, 或同一 src 处于非活跃/正在连接状态的旧会话
 	var stale []*exposeSession
 	m.mu.Lock()
 	for k, existing := range m.sessions {
@@ -868,7 +869,6 @@ func (m *exposeManager) acceptOffer(src string, sig pjSignal) {
 			delete(m.sessions, k)
 		}
 	}
-	// 若总会话数超出 maxPeers, 淘汰最早的一个非 Connected 会话
 	if len(m.sessions) >= m.cfg.maxPeers {
 		for k, existing := range m.sessions {
 			if existing.peer == src || existing.pc.ConnectionState() != webrtc.PeerConnectionStateConnected {
@@ -918,19 +918,23 @@ func (m *exposeManager) acceptOffer(src string, sig pjSignal) {
 	globalStats.activePeers.Store(int64(peerCount))
 
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+		if dc.Label() == controlDataChannelLabel {
+			log.Printf("expose: [%s] control datachannel registered (label=%s)", key, dc.Label())
+			sess.dcOpened.Store(true)
+			msgCh, openCh := wireControlChannel(dc)
+			dc.OnClose(func() {
+				sess.close()
+			})
+			go runNativeUDPExposeWithChan(sess.ctx, m.cfg, dc, sess.close, msgCh, openCh)
+			return
+		}
 		dc.OnOpen(func() {
 			log.Printf("expose: [%s] datachannel open (label=%s)", key, dc.Label())
 			sess.dcOpened.Store(true)
-			if dc.Label() == hy2DataChannelLabel {
-				go runHy2Expose(m.cfg, sess, dc)
-				return
-			}
 			if dc.Label() == quicDataChannelLabel {
 				go runQUICExpose(m.cfg, sess, dc)
 				return
 			}
-			// handler 在 OnMessage 注册前拿到 transport 自身, 首帧不会因为
-			// sess.tr 尚未赋值而被丢弃 (OnOpen 与 OnMessage 在不同协程).
 			t := newTransport(dc, func(t *transport) frameHandler {
 				return func(typ uint8, id uint32, payload []byte) {
 					if sess.closed.Load() {
@@ -967,7 +971,6 @@ func (m *exposeManager) acceptOffer(src string, sig pjSignal) {
 		case webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
 			sess.close()
 		case webrtc.PeerConnectionStateDisconnected:
-			// 若处于 Disconnected 超过 12s 未恢复, 主动回收该会话
 			go func() {
 				if !sleepOrStop(12*time.Second, sess.done) {
 					return
@@ -980,7 +983,6 @@ func (m *exposeManager) acceptOffer(src string, sig pjSignal) {
 		}
 	})
 
-	// 半通自愈: 25s 内 DataChannel 未就绪则回收该会话 (不影响其他在线客户端与信令常驻!)
 	go func() {
 		if !sleepOrStop(25*time.Second, sess.done) {
 			return
@@ -1032,7 +1034,6 @@ func handleFrameExpose(cfg config, reg *streamReg, tr *transport, sessCtx contex
 	}
 	switch typ {
 	case frameSyn:
-		// 限制单会话并发流数, 避免对端洪泛 frameSyn 时每个都挂一个 5s 拨号协程和 FD.
 		if reg.count() >= maxStreamsPerSession {
 			log.Printf("expose: too many streams (%d), rejecting SYN id=%d", reg.count(), id)
 			_ = tr.send(frameRst, id, nil)
@@ -1047,7 +1048,7 @@ func handleFrameExpose(cfg config, reg *streamReg, tr *transport, sessCtx contex
 			go func() {
 				select {
 				case <-st.stopped:
-					cancel() // RST/会话关闭时立即取消挂起拨号
+					cancel()
 				case <-watched:
 				}
 			}()
@@ -1112,8 +1113,8 @@ func runConnect(args []string) {
 	}
 	defer cleanup()
 
-	log.Printf("connect: id=%s peer=%s listen=%s brokers=%s on-demand=%v secret=***",
-		cfg.id, cfg.peer, cfg.listen, strings.Join(cfg.brokers, ","), cfg.onDemand)
+	log.Printf("connect: id=%s peer=%s listen=%s proto=%s bandwidth=%dMbps brokers=%s on-demand=%v secret=***",
+		cfg.id, cfg.peer, cfg.listen, cfg.effectiveProto(), cfg.bandwidthMbps, strings.Join(cfg.brokers, ","), cfg.onDemand)
 
 	lis, err := net.Listen("tcp", cfg.listen)
 	if err != nil {
@@ -1134,6 +1135,7 @@ func runConnect(args []string) {
 	globalStats.peerID = cfg.id
 	globalStats.remotePeer = cfg.peer
 	globalStats.targetOrLis = cfg.listen
+	globalStats.setTransport(cfg.effectiveProto(), "")
 
 	connCh := make(chan pendingConn, 128)
 	wakeCh := make(chan struct{}, 1)
@@ -1155,9 +1157,6 @@ func runConnect(args []string) {
 	}
 	globalStats.setTriggerReconnect(forceReconnect)
 
-	// shutdown 是完整优雅退出: 关 stop、关监听、取消当前会话.
-	// 信号与 status server 的 /quit 共用, 避免 /quit 只关 stop 而主循环
-	// 仍卡在 sess.run() 里退不出来 (Windows 上 stop 命令依赖 /quit).
 	shutdown := func() {
 		closeStop()
 		_ = lis.Close()
@@ -1206,7 +1205,6 @@ func runConnect(args []string) {
 				}
 			}
 			tuneTCPConn(c)
-			// 先入队再唤醒: 主循环醒来时 len(connCh) 必须已经反映这次连接.
 			select {
 			case connCh <- pendingConn{conn: c, accepted: time.Now()}:
 				select {
@@ -1227,10 +1225,7 @@ func runConnect(args []string) {
 		default:
 		}
 
-		// 按需连接模式 (-on-demand): 当没有本地 TCP 连接等待时休眠省电, 有连接到达时立即唤醒打洞
 		if cfg.onDemand && len(connCh) == 0 {
-			// 隧道在线期间到达的连接会留下一个没人消费的 wakeCh 信号,
-			// 先排空它, 避免休眠后立刻假唤醒; 排空后二次确认队列仍为空再阻塞.
 			select {
 			case <-wakeCh:
 			default:
@@ -1277,7 +1272,6 @@ func runConnect(args []string) {
 			globalStats.setError(err)
 		}
 
-		// 若由于自动生成的 ID 撞名导致 ID-TAKEN, 立即换一个新 ID 重试, 无需等待
 		if errors.Is(err, errIDTaken) && !cfg.idExplicit {
 			cfg.id = "phone-" + randHex(4)
 			globalStats.peerID = cfg.id
@@ -1286,7 +1280,6 @@ func runConnect(args []string) {
 			continue
 		}
 
-		// 若刚刚处于已连通状态后断开 (例如手机切网或短暂闪断), 首次重连仅等 400ms 实现极速恢复!
 		var wait time.Duration
 		if wasReady {
 			attempt = 0
@@ -1330,10 +1323,10 @@ type tunnelSess struct {
 	sc         *signalingClient
 	trMu       sync.Mutex
 	tr         *transport
-	quicMu     sync.Mutex
-	quicConn   quic.Connection
 	hy2Mu      sync.Mutex
 	hy2Client  hyClient.Client
+	quicMu     sync.Mutex
+	quicConn   *quic.Conn
 	ctx        context.Context
 	ctxCancel  context.CancelFunc
 	trReady    chan struct{}
@@ -1347,9 +1340,13 @@ type tunnelSess struct {
 	once       sync.Once
 }
 
-func newTunnelSess(cfg config, connCh chan pendingConn, peer string, stop <-chan struct{}) *tunnelSess {
+func newTunnelSess(cfg config, connCh chan pendingConn, peer string, stop ...<-chan struct{}) *tunnelSess {
+	var stopCh <-chan struct{}
+	if len(stop) > 0 {
+		stopCh = stop[0]
+	}
 	cancelCh := make(chan struct{})
-	ctx, cancelFn := contextWithStops(stop, cancelCh)
+	ctx, cancelFn := contextWithStops(stopCh, cancelCh)
 	s := &tunnelSess{
 		cfg:       cfg,
 		connCh:    connCh,
@@ -1359,7 +1356,7 @@ func newTunnelSess(cfg config, connCh chan pendingConn, peer string, stop <-chan
 		trReady:   make(chan struct{}),
 		reg:       newStreamReg(),
 		cancel:    cancelCh,
-		stop:      stop,
+		stop:      stopCh,
 		ctx:       ctx,
 		ctxCancel: cancelFn,
 	}
@@ -1396,52 +1393,58 @@ func (s *tunnelSess) run() error {
 	s.pc = pc
 	sdp := &sdpState{}
 
+	proto := s.cfg.effectiveProto()
 	var dc *webrtc.DataChannel
-	label := "p2ptun"
-	if s.cfg.proto == "hy2" {
-		label = hy2DataChannelLabel
-	} else if s.cfg.proto == "quic" || (s.cfg.proto == "" && s.cfg.useQUIC) {
-		label = quicDataChannelLabel
-	}
+	var ctrlMsgCh <-chan webrtc.DataChannelMessage
+	var ctrlOpenCh <-chan struct{}
 
-	if label == "p2ptun" {
-		dc, err = pc.CreateDataChannel("p2ptun", &webrtc.DataChannelInit{Ordered: boolPtr(true)})
-	} else {
+	switch proto {
+	case "hy2", "quic":
+		dc, err = pc.CreateDataChannel(controlDataChannelLabel, &webrtc.DataChannelInit{Ordered: boolPtr(true)})
+		if err == nil {
+			ctrlMsgCh, ctrlOpenCh = wireControlChannel(dc, func() {
+				log.Printf("connect: datachannel open (conn=%s, label=%s)", s.connID, dc.Label())
+				s.lastActive.Store(time.Now().UnixNano())
+				go runNativeUDPConnectWithChan(s, dc, ctrlMsgCh, ctrlOpenCh)
+			})
+		}
+	case "dc-quic":
 		ordered := false
 		maxRetransmits := uint16(0)
-		dc, err = pc.CreateDataChannel(label, &webrtc.DataChannelInit{
+		dc, err = pc.CreateDataChannel(quicDataChannelLabel, &webrtc.DataChannelInit{
 			Ordered:        &ordered,
 			MaxRetransmits: &maxRetransmits,
 		})
+	default:
+		dc, err = pc.CreateDataChannel("p2ptun", &webrtc.DataChannelInit{Ordered: boolPtr(true)})
 	}
 	if err != nil {
 		return err
 	}
-	dc.OnOpen(func() {
-		log.Printf("connect: datachannel open (conn=%s, label=%s)", s.connID, dc.Label())
-		s.wasReady.Store(true)
-		s.lastActive.Store(time.Now().UnixNano())
-		globalStats.activePeers.Store(1)
-		if dc.Label() == hy2DataChannelLabel {
-			go runHy2Connect(s, dc)
-			return
-		}
-		if dc.Label() == quicDataChannelLabel {
-			go runQUICConnect(s, dc)
-			return
-		}
-		t := newTransport(dc, func(t *transport) frameHandler {
-			return func(typ uint8, id uint32, payload []byte) {
-				s.lastActive.Store(time.Now().UnixNano())
-				handleFrameConnect(s.reg, t, typ, id, payload)
+
+	if proto != "hy2" && proto != "quic" {
+		dc.OnOpen(func() {
+			log.Printf("connect: datachannel open (conn=%s, label=%s)", s.connID, dc.Label())
+			s.lastActive.Store(time.Now().UnixNano())
+			if dc.Label() == quicDataChannelLabel {
+				go runQUICConnect(s, dc)
+				return
 			}
-		}, s.cancelFn)
-		t.startKeepalive(s.cfg.keepalive)
-		s.trMu.Lock()
-		s.tr = t
-		s.trMu.Unlock()
-		s.readyOnce.Do(func() { close(s.trReady) })
-	})
+			s.wasReady.Store(true)
+			globalStats.activePeers.Store(1)
+			t := newTransport(dc, func(t *transport) frameHandler {
+				return func(typ uint8, id uint32, payload []byte) {
+					s.lastActive.Store(time.Now().UnixNano())
+					handleFrameConnect(s.reg, t, typ, id, payload)
+				}
+			}, s.cancelFn)
+			t.startKeepalive(s.cfg.keepalive)
+			s.trMu.Lock()
+			s.tr = t
+			s.trMu.Unlock()
+			s.readyOnce.Do(func() { close(s.trReady) })
+		})
+	}
 	dc.OnClose(func() { s.cancelFn() })
 
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
@@ -1475,18 +1478,16 @@ func (s *tunnelSess) run() error {
 			}()
 		}
 	})
-	// ICE 握手超时自愈: 15s 内 DataChannel 未就绪则自动重发新会话
 	go func() {
-		if !sleepOrStop(15*time.Second, s.cancel) {
+		if !sleepOrStop(20*time.Second, s.cancel) {
 			return
 		}
 		if !s.wasReady.Load() {
-			log.Printf("connect: tunnel not ready after 15s (pc=%s), restarting session", pc.ConnectionState())
+			log.Printf("connect: tunnel not ready after 20s (pc=%s), restarting session", pc.ConnectionState())
 			s.cancelFn()
 		}
 	}()
 
-	// 按需模式下若超过 idleTimeout 无活跃流, 自动挂起连接省电
 	if s.cfg.onDemand && s.cfg.idleTimeout > 0 {
 		go func() {
 			ticker := time.NewTicker(10 * time.Second)
@@ -1510,16 +1511,14 @@ func (s *tunnelSess) run() error {
 		}()
 	}
 
-	// /quit、SIGTERM 或会话结束时立即打断正在进行的信令拨号, 避免关机等 6~15s 超时.
 	ctx, cancel := contextWithStops(s.cancel, s.stop)
 	defer cancel()
 
 	sc, err := dialSignalingAny(ctx, s.cfg.brokers, s.cfg.key, s.cfg.id, s.token, func(typ, src string, sig pjSignal) {
 		s.onSignal(typ, src, sig, sdp)
 	}, func(err error) {
-		// 信令断开时: 如果 WebRTC DataChannel 已经建立直连, P2P 数据面无需因信令闪断而自杀!
 		if s.wasReady.Load() {
-			log.Printf("connect: signaling ws closed (%v), keeping active P2P datachannel alive", err)
+			log.Printf("connect: signaling ws closed (%v), keeping active P2P tunnel alive", err)
 			globalStats.signalingUp.Store(false)
 			return
 		}
@@ -1594,8 +1593,6 @@ func (s *tunnelSess) onSignal(typ, src string, sig pjSignal, sdp *sdpState) {
 	}
 }
 
-// acceptLoop 仅在 DataChannel 就绪 (<-s.trReady) 后才从队列取出本地 TCP 连接,
-// 避免在重连握手期间误取并直接关闭用户的 SSH 连接请求!
 func (s *tunnelSess) acceptLoop() {
 	select {
 	case <-s.trReady:
@@ -1615,12 +1612,11 @@ func (s *tunnelSess) acceptLoop() {
 			if item.conn == nil {
 				return
 			}
-			// 如果该连接在队列里等待太久 (>30s), 关闭丢弃
-			if time.Since(item.accepted) > 30*time.Second {
+			if !item.accepted.IsZero() && time.Since(item.accepted) > 30*time.Second {
 				_ = item.conn.Close()
 				continue
 			}
-			s.registerConn(item)
+			s.registerPendingConn(item)
 		}
 	}
 }
@@ -1633,8 +1629,25 @@ func (s *tunnelSess) requeue(item pendingConn) {
 	}
 }
 
-func (s *tunnelSess) registerConn(item pendingConn) {
-	if s.cfg.proto == "hy2" {
+// registerConn 兼容直接传入 net.Conn 的调用方 (如 native_udp_test.go)
+func (s *tunnelSess) registerConn(c net.Conn) {
+	s.registerPendingConn(pendingConn{conn: c, accepted: time.Now()})
+}
+
+func (s *tunnelSess) registerPendingConn(item pendingConn) {
+	select {
+	case <-s.trReady:
+	case <-s.cancel:
+		_ = item.conn.Close()
+		return
+	}
+
+	proto := s.cfg.effectiveProto()
+	touchActive := func() {
+		s.lastActive.Store(time.Now().UnixNano())
+	}
+
+	if proto == "hy2" {
 		s.hy2Mu.Lock()
 		client := s.hy2Client
 		s.hy2Mu.Unlock()
@@ -1643,39 +1656,34 @@ func (s *tunnelSess) registerConn(item pendingConn) {
 			s.cancelFn()
 			return
 		}
-		s.lastActive.Store(time.Now().UnixNano())
-		go func(c net.Conn) {
-			globalStats.activeStreams.Add(1)
-			defer globalStats.activeStreams.Add(-1)
+		if s.reg.count() >= maxStreamsPerSession {
+			_ = item.conn.Close()
+			return
+		}
+		id := s.reg.allocID()
+		marker := newStream(id, nil)
+		s.reg.add(marker)
+		touchActive()
+
+		go func(c net.Conn, streamID uint32) {
+			defer func() {
+				s.reg.remove(streamID)
+				marker.stop()
+				_ = c.Close()
+			}()
 			targetStream, err := client.TCP("target")
 			if err != nil {
-				log.Printf("connect: hy2 tcp failed: %v", err)
-				_ = c.Close()
+				log.Printf("connect: hy2 open stream failed: %v", err)
 				return
 			}
 			defer targetStream.Close()
-			defer c.Close()
 			tuneTCPConn(c)
-			var wg sync.WaitGroup
-			wg.Add(2)
-			go func() {
-				defer wg.Done()
-				_, _ = io.Copy(targetStream, c)
-				_ = targetStream.Close()
-			}()
-			go func() {
-				defer wg.Done()
-				_, _ = io.Copy(c, targetStream)
-				if cw, ok := c.(interface{ CloseWrite() error }); ok {
-					_ = cw.CloseWrite()
-				}
-			}()
-			wg.Wait()
-		}(item.conn)
+			pipeBidirectional(c, targetStream, touchActive)
+		}(item.conn, id)
 		return
 	}
 
-	if s.cfg.proto == "quic" || s.cfg.useQUIC {
+	if proto == "quic" || proto == "dc-quic" {
 		s.quicMu.Lock()
 		qConn := s.quicConn
 		s.quicMu.Unlock()
@@ -1684,20 +1692,36 @@ func (s *tunnelSess) registerConn(item pendingConn) {
 			s.cancelFn()
 			return
 		}
-		s.lastActive.Store(time.Now().UnixNano())
-		go func(c net.Conn) {
-			dialCtx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
-			defer cancel()
-			qStream, err := qConn.OpenStreamSync(dialCtx)
-			if err != nil {
-				log.Printf("connect: open quic stream failed: %v", err)
+		if s.reg.count() >= maxStreamsPerSession {
+			_ = item.conn.Close()
+			return
+		}
+		id := s.reg.allocID()
+		marker := newStream(id, nil)
+		s.reg.add(marker)
+		touchActive()
+
+		go func(c net.Conn, streamID uint32) {
+			defer func() {
+				s.reg.remove(streamID)
+				marker.stop()
 				_ = c.Close()
+			}()
+			dialCtx := s.ctx
+			if dialCtx == nil {
+				dialCtx = context.Background()
+			}
+			dctx, cancel := context.WithTimeout(dialCtx, 10*time.Second)
+			qStream, err := qConn.OpenStreamSync(dctx)
+			cancel()
+			if err != nil {
+				log.Printf("connect: quic open stream failed: %v", err)
 				return
 			}
-			globalStats.activeStreams.Add(1)
-			defer globalStats.activeStreams.Add(-1)
-			pipeStream(c, qStream)
-		}(item.conn)
+			defer qStream.Close()
+			tuneTCPConn(c)
+			pipeBidirectional(c, qStream, touchActive)
+		}(item.conn, id)
 		return
 	}
 
@@ -1705,8 +1729,6 @@ func (s *tunnelSess) registerConn(item pendingConn) {
 	tr := s.tr
 	s.trMu.Unlock()
 	if tr == nil {
-		// 隧道刚断, 连接放回队列供下一轮重连使用; 立即结束本会话,
-		// 否则 acceptLoop 会从队列里取出同一连接并立即失败, 形成忙等自旋.
 		s.requeue(item)
 		s.cancelFn()
 		return
@@ -1722,20 +1744,18 @@ func (s *tunnelSess) registerConn(item pendingConn) {
 	st := newStream(id, c)
 	s.reg.add(st)
 
-	// 关键修复: 必须先发送 frameSyn 再启动 connToDC 读取协程!
-	// 原版先起 go connToDC 再发 frameSyn, 导致客户端首包 (frameData) 可能早于 frameSyn 到达对端被静默丢弃!
 	if err := tr.send(frameSyn, id, nil); err != nil {
 		log.Printf("connect: SYN failed: %v, re-queueing connection", err)
 		s.reg.remove(id)
 		s.requeue(item)
-		s.cancelFn() // 结束本会话, 由下一轮新会话消费队列中的连接
+		s.cancelFn()
 		return
 	}
 
-	s.lastActive.Store(time.Now().UnixNano())
+	touchActive()
 	cleanup := func() { s.reg.remove(id) }
 	go connToDC(c, id, st, func(tt uint8, p []byte) error {
-		s.lastActive.Store(time.Now().UnixNano())
+		touchActive()
 		return tr.send(tt, id, p)
 	}, cleanup)
 	go dcToConn(c, st, func() {

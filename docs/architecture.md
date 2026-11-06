@@ -1,7 +1,7 @@
-# p2ptun 架构 (v0.4.0)
+# p2ptun 架构 (v0.2.1)
 
-设计目标：**远程 SSH/代理/TCP 全程优先 P2P 直连；信令服务器（PeerJS cloud）只交换 SDP/ICE，
-绝不经过业务数据。同时针对常驻守护、多次连接（并发多端与快速重连）、复杂跨洋网络环境提供 Hysteria 2 Brutal CC 加速与自愈容灾能力。**
+设计目标：**远程 SSH/TCP 全程优先 P2P 直连；信令服务器（PeerJS cloud）只交换 SDP/ICE，
+绝不经过业务数据。同时针对常驻守护、多次连接（并发多端与快速重连）、复杂网络环境提供完整的自愈与容灾能力。**
 
 ```
 ┌─ remote (Termux / Laptop) ─┐        ┌─ WSL / Service Owner ──────┐
@@ -33,19 +33,9 @@
 | `LEAVE` | 会话主动退出或重建时通知对端立即释放 `PeerConnection` |
 | `ID-TAKEN` | 识别异常断线后的残留 ID 冲突：`expose` 自动退避等待清理，`connect` 自动轮换随机 ID |
 
-## 2. 数据传输层（三模支持：`hy2`、`quic`、`classic`）
+## 2. 数据面（`bridge.go`：单 DataChannel 多路复用 + 应用层心跳）
 
-### 2.1 Hysteria 2 传输加速（默认 `-proto hy2`，`hy2_transport.go`）
-在 WebRTC DataChannel 之上构建 `net.PacketConn` 抽象，承载完整的 Hysteria 2 协议栈与 Brutal 拥塞控制算法：
-- **Brutal 拥塞控制**：中美跨洋与长途链路（RTT ~180ms+）天然伴随 2%~5% 丢包，传统 Cubic/BBR 遇到丢包会强制降低拥塞窗口（cwnd），造成速度暴跌。Brutal 拥塞控制根据配置的带宽（`-bandwidth`，默认 50Mbps，可设置 100/200Mbps）恒定发包，彻底抵消丢包惩罚。
-- **16MB SCTP 接收缓冲区**：将底层 Pion WebRTC `SettingEngine.SetSCTPMaxReceiveBufferSize` 由默认 1MB 扩展至 16MB，打通高 BDP（带宽延迟积）链路吞吐，回环压测可跑满 112+ Mbps。
-- **DataChannel 标识**：通道标签为 `p2ptun-hy2`，由服务端自动根据客户端标签自适应分发。
-
-### 2.2 标准 QUIC 模式（`-proto quic`，`quic_transport.go`）
-基于 `quic-go` 的原生 QUIC 实现，采用标准 Cubic 拥塞控制与 TLS 1.3，通道标签为 `p2ptun-quic`。
-
-### 2.3 经典轻量模式（`-proto classic`，`bridge.go`）
-一条 DataChannel 上通过自定义 9 字节帧头多路复用任意数量的并发 TCP 连接：
+一条 DataChannel 上多路复用任意数量的并发 TCP 连接：
 
 ```
 9-字节帧头 + payload
