@@ -449,3 +449,283 @@ func TestControlDataChannelSchedulingE2E(t *testing.T) {
 	}
 	t.Log("End-to-End: 5 parallel streams successfully streamed and echoed over native UDP!")
 }
+
+func TestNativeUDPThroughputBenchmark(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	agentA, _ := ice.NewAgent(&ice.AgentConfig{NetworkTypes: []ice.NetworkType{ice.NetworkTypeUDP4}, IncludeLoopback: true})
+	defer agentA.Close()
+	agentB, _ := ice.NewAgent(&ice.AgentConfig{NetworkTypes: []ice.NetworkType{ice.NetworkTypeUDP4}, IncludeLoopback: true})
+	defer agentB.Close()
+
+	ufragA, pwdA, _ := agentA.GetLocalUserCredentials()
+	ufragB, pwdB, _ := agentB.GetLocalUserCredentials()
+
+	_ = agentA.OnCandidate(func(c ice.Candidate) {
+		if c != nil {
+			cand, _ := ice.UnmarshalCandidate(c.Marshal())
+			_ = agentB.AddRemoteCandidate(cand)
+		}
+	})
+	_ = agentB.OnCandidate(func(c ice.Candidate) {
+		if c != nil {
+			cand, _ := ice.UnmarshalCandidate(c.Marshal())
+			_ = agentA.AddRemoteCandidate(cand)
+		}
+	})
+
+	var connA, connB *ice.Conn
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		connA, _ = agentA.Dial(ctx, ufragB, pwdB)
+	}()
+	go func() {
+		defer wg.Done()
+		connB, _ = agentB.Accept(ctx, ufragA, pwdA)
+	}()
+	_ = agentA.GatherCandidates()
+	_ = agentB.GatherCandidates()
+	wg.Wait()
+
+	defer connA.Close()
+	defer connB.Close()
+
+	pConnServer := &icePacketConn{conn: connB}
+	pConnClient := &icePacketConn{conn: connA}
+
+	// Local Echo TCP Listener
+	targetLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer targetLis.Close()
+	go func() {
+		for {
+			c, err := targetLis.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				_, _ = io.Copy(conn, conn)
+			}(c)
+		}
+	}()
+
+	bwMbps := 100
+	bwBytesPerSec := uint64(bwMbps) * 1024 * 1024 / 8
+
+	hySrv, err := hyServer.NewServer(&hyServer.Config{
+		Conn: pConnServer,
+		TLSConfig: hyServer.TLSConfig{
+			Certificates: []tls.Certificate{globalECDSACert},
+		},
+		Authenticator: &hy2Auth{secret: "bench-secret"},
+		Outbound:      &hy2Outbound{target: targetLis.Addr().String()},
+		BandwidthConfig: hyServer.BandwidthConfig{
+			MaxTx: bwBytesPerSec,
+			MaxRx: bwBytesPerSec,
+		},
+		DisableUDP: true,
+	})
+	if err != nil {
+		t.Fatalf("hyServer: %v", err)
+	}
+	defer hySrv.Close()
+	go func() { _ = hySrv.Serve() }()
+
+	hyCli, info, err := hyClient.NewClient(&hyClient.Config{
+		ConnFactory: &hy2ConnFactory{conn: pConnClient},
+		ServerAddr:  connB.LocalAddr(),
+		Auth:        "bench-secret",
+		TLSConfig: hyClient.TLSConfig{
+			InsecureSkipVerify: true,
+		},
+		BandwidthConfig: hyClient.BandwidthConfig{
+			MaxTx: bwBytesPerSec,
+			MaxRx: bwBytesPerSec,
+		},
+		FastOpen: true,
+	})
+	if err != nil {
+		t.Fatalf("hyClient: %v", err)
+	}
+	defer hyCli.Close()
+	t.Logf("Benchmark: Hysteria 2 connected! Tx=%d bps", info.Tx)
+
+	// Stream 5MB of payload
+	dataSize := 5 * 1024 * 1024
+	testData := make([]byte, dataSize)
+	for i := range testData {
+		testData[i] = byte(i % 256)
+	}
+
+	stream, err := hyCli.TCP("echo")
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+
+	start := time.Now()
+	var wgBench sync.WaitGroup
+	wgBench.Add(2)
+	go func() {
+		defer wgBench.Done()
+		_, _ = stream.Write(testData)
+	}()
+
+	recvBuf := make([]byte, dataSize)
+	var n int
+	var readErr error
+	go func() {
+		defer wgBench.Done()
+		n, readErr = io.ReadFull(stream, recvBuf)
+	}()
+	wgBench.Wait()
+	_ = stream.Close()
+	elapsed := time.Since(start)
+
+	if readErr != nil {
+		t.Fatalf("read: %v", readErr)
+	}
+
+	if n != dataSize {
+		t.Fatalf("size mismatch: got %d, want %d", n, dataSize)
+	}
+
+	mbps := float64(dataSize*8) / (elapsed.Seconds() * 1000 * 1000)
+	t.Logf("Benchmark Result: 5MB transferred in %v -> %.2f Mbps (%.2f MB/s)", elapsed, mbps, float64(dataSize)/elapsed.Seconds()/1024/1024)
+}
+
+func TestNativeQUICThroughputBenchmark(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	agentA, _ := ice.NewAgent(&ice.AgentConfig{NetworkTypes: []ice.NetworkType{ice.NetworkTypeUDP4}, IncludeLoopback: true})
+	defer agentA.Close()
+	agentB, _ := ice.NewAgent(&ice.AgentConfig{NetworkTypes: []ice.NetworkType{ice.NetworkTypeUDP4}, IncludeLoopback: true})
+	defer agentB.Close()
+
+	ufragA, pwdA, _ := agentA.GetLocalUserCredentials()
+	ufragB, pwdB, _ := agentB.GetLocalUserCredentials()
+
+	_ = agentA.OnCandidate(func(c ice.Candidate) {
+		if c != nil {
+			cand, _ := ice.UnmarshalCandidate(c.Marshal())
+			_ = agentB.AddRemoteCandidate(cand)
+		}
+	})
+	_ = agentB.OnCandidate(func(c ice.Candidate) {
+		if c != nil {
+			cand, _ := ice.UnmarshalCandidate(c.Marshal())
+			_ = agentA.AddRemoteCandidate(cand)
+		}
+	})
+
+	var connA, connB *ice.Conn
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		connA, _ = agentA.Dial(ctx, ufragB, pwdB)
+	}()
+	go func() {
+		defer wg.Done()
+		connB, _ = agentB.Accept(ctx, ufragA, pwdA)
+	}()
+	_ = agentA.GatherCandidates()
+	_ = agentB.GatherCandidates()
+	wg.Wait()
+
+	defer connA.Close()
+	defer connB.Close()
+
+	pConnServer := &icePacketConn{conn: connB}
+	pConnClient := &icePacketConn{conn: connA}
+
+	alpn := "p2ptun-bench-quic"
+	serverTLS := &tls.Config{
+		Certificates: []tls.Certificate{globalECDSACert},
+		NextProtos:   []string{alpn},
+	}
+	quicConf := &quic.Config{
+		KeepAlivePeriod: 5 * time.Second,
+		MaxIdleTimeout:  30 * time.Second,
+	}
+
+	trServer := &quic.Transport{Conn: pConnServer}
+	defer trServer.Close()
+	listener, err := trServer.Listen(serverTLS, quicConf)
+	if err != nil {
+		t.Fatalf("trServer.Listen: %v", err)
+	}
+	defer listener.Close()
+
+	go func() {
+		qConn, err := listener.Accept(ctx)
+		if err != nil {
+			return
+		}
+		defer qConn.CloseWithError(0, "bye")
+		stream, err := qConn.AcceptStream(ctx)
+		if err != nil {
+			return
+		}
+		defer stream.Close()
+		_, _ = io.Copy(stream, stream)
+	}()
+
+	trClient := &quic.Transport{Conn: pConnClient}
+	defer trClient.Close()
+	clientTLS := &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{alpn},
+	}
+	qConn, err := trClient.Dial(ctx, connB.LocalAddr(), clientTLS, quicConf)
+	if err != nil {
+		t.Fatalf("trClient.Dial: %v", err)
+	}
+	defer qConn.CloseWithError(0, "bye")
+
+	stream, err := qConn.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("OpenStreamSync: %v", err)
+	}
+	defer stream.Close()
+
+	dataSize := 5 * 1024 * 1024
+	testData := make([]byte, dataSize)
+	for i := range testData {
+		testData[i] = byte(i % 256)
+	}
+
+	start := time.Now()
+	var wgBench sync.WaitGroup
+	wgBench.Add(2)
+	go func() {
+		defer wgBench.Done()
+		_, _ = stream.Write(testData)
+	}()
+
+	recvBuf := make([]byte, dataSize)
+	var n int
+	var readErr error
+	go func() {
+		defer wgBench.Done()
+		n, readErr = io.ReadFull(stream, recvBuf)
+	}()
+	wgBench.Wait()
+	elapsed := time.Since(start)
+
+	if readErr != nil {
+		t.Fatalf("read: %v", readErr)
+	}
+	if n != dataSize {
+		t.Fatalf("size mismatch: got %d, want %d", n, dataSize)
+	}
+
+	mbps := float64(dataSize*8) / (elapsed.Seconds() * 1000 * 1000)
+	t.Logf("QUIC Benchmark Result: 5MB transferred in %v -> %.2f Mbps (%.2f MB/s)", elapsed, mbps, float64(dataSize)/elapsed.Seconds()/1024/1024)
+}

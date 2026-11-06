@@ -121,8 +121,9 @@ func parseStunURIs(stuns []string) []*stun.URI {
 func buildICEAgent(cfg config) (*ice.Agent, error) {
 	uris := parseStunURIs(cfg.stun)
 	agentConfig := &ice.AgentConfig{
-		Urls:         uris,
-		NetworkTypes: []ice.NetworkType{ice.NetworkTypeUDP4, ice.NetworkTypeUDP6},
+		Urls:            uris,
+		NetworkTypes:    []ice.NetworkType{ice.NetworkTypeUDP4, ice.NetworkTypeUDP6},
+		IncludeLoopback: true,
 	}
 	return ice.NewAgent(agentConfig)
 }
