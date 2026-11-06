@@ -33,29 +33,53 @@
 | `LEAVE` | 会话主动退出或重建时通知对端立即释放 `PeerConnection` |
 | `ID-TAKEN` | 识别异常断线后的残留 ID 冲突：`expose` 自动退避等待清理，`connect` 自动轮换随机 ID |
 
-## 2. 数据面（`bridge.go`：单 DataChannel 多路复用 + 应用层心跳）
+## 2. 控制调度面与数据传输面分离
 
-一条 DataChannel 上多路复用任意数量的并发 TCP 连接：
+`v0.5.x` 架构彻底解耦了控制调度面与数据传输面：
 
 ```
-9-字节帧头 + payload
-┌──────┬────────────┬────────────┬─────────────┐
-│ type │  connID(4) │ length(4)  │   payload   │
-│ 1B   │             BE, uint32   │             │
-└──────┴────────────┴────────────┴─────────────┘
-
-type:
-  1 = SYN  (新建 TCP 流，在启动读取协程前先行发送，确保首包绝不乱序丢失)
-  2 = DATA (TCP 数据负载)
-  3 = FIN  (优雅半关闭 EOF：排空已入队数据后再关闭本地 socket)
-  4 = PING (通道保活探测，携带 8B 纳秒时间戳，维持 NAT 映射并测量 RTT，向后兼容 v0.1.x)
-  5 = PONG (通道保活应答)
-  6 = RST  (异常重置流，如目标端口连接失败或本地写入断开)
+                    ┌────────────────────────┐
+                    │ PeerJS WebSocket (WSS) │ (交换 SDP / ICE 候选)
+                    └───────────┬────────────┘
+                                │
+               ┌────────────────┴────────────────┐
+               ▼                                 ▼
+   [Control Plane] SCTP DataChannel       [Control Plane] SCTP DataChannel
+   label: "p2ptun-control"                label: "p2ptun-control"
+   (配对认证、协议握手、交换 UDP 候选地址)  (配对认证、协议握手、交换 UDP 候选地址)
+               │                                 │
+               └────────────────┬────────────────┘
+                                │ 调度原生 ICE 打洞
+                                ▼
+               ┌─────────────────────────────────┐
+               │    Native UDP Direct Punching   │ (纯原生裸 UDP 打洞)
+               └────────────────┬────────────────┘
+                                │
+        ┌───────────────────────┴───────────────────────┐
+        ▼                                               ▼
+[Data Plane] Hysteria 2 (默认)                [Data Plane] Native QUIC
+• apernet/hysteria/core/v2                     • quic-go (TLS 1.3) 多路复用
+• Brutal 恒定发包拥塞控制 (50~200 Mbps)        • 单 5-tuple 多并发 Stream
+• 彻底消除 SCTP 1 秒 RTO 与丢包断崖降速        • 适合低丢包、高带宽环境
 ```
 
-- **背压控制**：发送侧根据 `bufferedAmount` 做流控（>4MB 暂停读取 TCP，回落到 1MB 恢复）。
-- **防饥饿隔离**：`PING`/`PONG` 控制帧在 `transport.dispatch` 直接处理；单条数据流队列满时带超时保护，绝不阻塞整条 DataChannel 上的其他 SSH 会话。
-- **零协程泄漏**：`dcToConn` 同时监听 `st.ch`、`st.finCh` 与 `st.stopped`，任何异常断开都能立即回收协程。
+### 2.1 控制调度面（SCTP `p2ptun-control`）
+- 双方建立基础 WebRTC 连接后，仅打开单条轻量级 SCTP DataChannel（`label=p2ptun-control`）。
+- **完全不跑业务数据**，专职执行：
+  1. 配对密钥（`secret`）二次校验；
+  2. 传输协议协商（`hy2` / `quic` / `classic`）与目标带宽协商（`-bandwidth`）；
+  3. 交换独立的 Native ICE 用户名/密码（ufrag/pwd）与 UDP 候选地址（`cand` / `cand_end`）。
+
+### 2.2 数据传输面（`native_udp.go`：原生裸 UDP 直连）
+- 双方经控制信道交换凭据后，由 `pion/ice.Agent` 发起原生 UDP 打洞，获得原生 `ice.Conn`（抽象为 `net.PacketConn`）。
+- **Hysteria 2 (`-proto hy2`，默认)**：
+  - 服务端运行 `hyServer.NewServer`，客户端运行 `hyClient.NewClient`。
+  - 使用 Brutal 拥塞控制算法，无论网络延迟多高或丢包率多少，均按照设定的目标带宽（如 50Mbps / 100Mbps）恒定发包，彻底解决跨国、移动弱网下 TCP 窗口崩溃和 SCTP 双重加密的卡顿问题。
+  - 支持单 UDP 连接内并发多路复用无限个 TCP 流。
+- **Native QUIC (`-proto quic`)**：
+  - 在原生打洞 UDP 上建立纯 `quic-go` 会话，内置 TLS 1.3 加密与流控。
+- **Classic 回退 (`-proto classic` / `bridge.go`)**：
+  - 保留作为兼容模式，在纯 DataChannel 上通过自定义 9 字节帧头进行流切片与多路复用。
 
 ## 3. 会话生命周期与多次连接管理（`main.go`）
 
@@ -86,3 +110,13 @@ type:
 
 - `-daemon` / `-d`：内置后台守护进程化，自动管理 PID 文件（`-pidfile`）与大小轮转日志（`-logfile`，默认 10MB 轮转）。
 - `p2ptun status` / `p2ptun stop` / `p2ptun service [systemd|termux]`：一键查看实时状态（含 RTT、重连次数、累计流量、活跃流数）、优雅停止（自动发送 `LEAVE` 避免 `ID-TAKEN`）及生成系统服务配置。
+- **控制面板与状态接口（`-status-addr` / `-panel-addr`）**：
+  - **默认严格关闭**：未显式指定监听地址时完全不开启 HTTP 端口，零额外暴露面。
+  - **按需启用**：显式指定 `-status-addr 127.0.0.1:18222`（或 0.0.0.0:8080 等）时开启，提供 `/status`（JSON 运行指标）、`/healthz`、`/reconnect` 与 `/quit`。
+  - **安全加固**：控制接口校验 HTTP 方法并严防 CSRF 跨站请求伪造，拒绝未经授权的外部重连或退出请求。
+
+## 6. 多人多端并发架构
+
+- **多客户端并发（Multi-Peer）**：服务端支持多设备同时连入（默认 `-max-peers 16`），客户端无需显式指定 `-id`，连接时自动分配唯一随机 ID，避免信令碰撞。
+- **独立 UDP 穿透**：每台客户端连入均由独立 ICE Agent 协调专属的 UDP 5-tuple 打洞，相互之间网络隔离、带宽独立、互不阻塞。
+- **单端多流并发（Multi-Stream）**：单台设备内部的海量连接在专属 UDP 上通过 Hysteria 2 / QUIC 进行单连接多路复用。

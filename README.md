@@ -32,15 +32,25 @@ Client (Termux / Windows / Mac)         Server (WSL / Cloud Shell / VPS)
 
 ```sh
 # 1. 服务端 (如 WSL / Linux 服务器，暴露 127.0.0.1:22，默认 Hysteria 2 恒定带宽)
+# 注意: 默认不开启控制面板 HTTP 端口; 若需要 Web 监控可加 -status-addr 127.0.0.1:18222
 P2PTUN_ID=wslssh-a1b2 P2PTUN_SECRET=hunter2 p2ptun expose -proto hy2 -bandwidth 100 -daemon
 
 # 2. 客户端 (如 Termux / 笔记本) — 随后执行: ssh -p 2222 user@127.0.0.1
+# 支持多台设备同时并发连接同一个服务端 (默认支持最多 16 台设备)
 P2PTUN_PEER=wslssh-a1b2 P2PTUN_SECRET=hunter2 p2ptun connect -listen 127.0.0.1:2222 -proto hy2 -bandwidth 100 -daemon
 
 # 3. 查看运行状态 / 活跃协议 / 原生 UDP 地址 / RTT 或停止守护进程
 p2ptun status
 p2ptun stop
 ```
+
+## Security & Architecture Concepts
+
+- **`ID` (`-id` / `-peer`)**：公共信令网（PeerJS）上的寻址标识（类似于电话号码）。客户端如果不指定 `-id`，会自动生成唯一的随机 ID（如 `phone-3b881fe7`），因此多台设备可并发呼叫同一个服务端 `-peer` 而不产生冲突。
+- **`SECRET` (`-secret`)**：两端配对密钥与通行证。
+  1. **信令防扫描**：信令协商时首先比对密钥，不匹配直接拒接（Reject），拒绝建立 WebRTC 连接。
+  2. **传输加密认证**：在打洞成功的原生 UDP 上握手时，Hysteria 2 / QUIC 再次验证密钥，双重保障隧道安全。
+- **控制面板（Control Panel）**：状态与控制 HTTP 接口（`/status`, `/healthz`, `/reconnect`, `/quit`）**默认严格关闭**，仅在显式传入 `-status-addr` / `-panel-addr` 时监听，避免任何多余端口暴露。
 
 ## Flags & Environment Variables
 

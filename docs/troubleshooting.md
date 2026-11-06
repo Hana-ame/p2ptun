@@ -1,30 +1,31 @@
-# 故障排查 (v0.2.1)
+# 故障排查 (v0.5.1)
 
-日志第一行会打印 `p2ptun 0.2.1 started (DNS: ...)`。也可随时通过 `p2ptun status` 查看当前守护进程状态、RTT、重连次数和最近错误。
+日志第一行会打印 `p2ptun 0.5.1 started (DNS: ...)`。也可随时通过 `p2ptun status` 查看当前守护进程状态、RTT、重连次数和最近错误。
 
 ## 1. 常驻运行与状态检查
 
 ### Termux 手机端常驻
 ```bash
-# 启动后台守护进程 (自动写入 ~/.p2ptun/p2ptun-connect.log 并轮转)
-P2PTUN_PEER=wslssh-a1b2 P2PTUN_SECRET=hunter2 p2ptun connect -daemon -status-addr 127.0.0.1:18222
+# 1. 启动后台守护进程 (自动写入 ~/.p2ptun/p2ptun-connect.log 并轮转)
+# 默认不开启任何控制面板 HTTP 端口; 若需要可通过 -status-addr / -panel-addr 显式指定
+P2PTUN_PEER=wslssh-a1b2 P2PTUN_SECRET=hunter2 p2ptun connect -daemon -proto hy2 -bandwidth 100
 termux-wake-lock
 
-# 查看运行状态与实时 RTT
-p2ptun status -status-addr 127.0.0.1:18222
+# 2. 查看运行状态与活跃传输协议 (无需 HTTP 端口, 直接读取 pidfile 探测)
+p2ptun status
 
-# 优雅停止 (会自动向信令服发送 LEAVE 释放 ID)
+# 若启动时显式指定了 -status-addr 127.0.0.1:18222, 可通过 HTTP 状态接口查看:
+# p2ptun status -status-addr 127.0.0.1:18222
+
+# 3. 优雅停止 (会自动向信令服发送 LEAVE 释放 ID)
 p2ptun stop
 ```
 
-> **端口选择**：`-status-addr` 没有默认值，不指定就不监听。示例用 `18222` 而不是
-> `9222`：`9222/9223` 是 Chromium/Edge 的 CDP 远程调试默认端口（kuuki-mouse/CUA 栈里
-> Edge `--remote-debugging-port=9222`、`CUA_DRIVER_CDP_PORT=9222` 就是它），同机同端口
-> 会导致后启动的一方 bind 失败：p2ptun 只告警不退出（status/stop 不可用），若 p2ptun
-> 先占住则浏览器 CDP 起不来。`9229` 同理是 Node inspector。脚本默认已避开这些端口，
-> 仍可用 `-status-addr` / `P2PTUN_STATUS_ADDR` 覆盖。
+> **控制面板/状态接口端口说明**：
+> `-status-addr`（别名 `-panel-addr` / `-control-addr`）**没有默认值，不指定监听地址即完全不开启**，保障零额外网络暴露。
+> 若需要开启控制面板，推荐使用 `18222`（避开 Chromium/Edge CDP 调试端口 `9222/9223` 与 Node inspector `9229`）。
 
-或者使用仓库自带的 `scripts/termux-daemon.sh`：
+或者使用仓库自带的 `scripts/termux-daemon.sh`（默认已遵循不开启控制面板规范）：
 ```bash
 P2PTUN_PEER=wslssh-a1b2 P2PTUN_SECRET=hunter2 bash scripts/termux-daemon.sh start
 bash scripts/termux-daemon.sh status
@@ -40,36 +41,47 @@ journalctl -u p2ptun -n 50 --no-pager
 
 ## 2. 信令连接不上 (`dial wss://0.peerjs.com ...`)
 
-v0.2.0 已内置三层自动容灾：
+`v0.5.1` 内置三层自动容灾：
 1. **多信令服自动切换**：默认依次尝试 `wss://0.peerjs.com` 与 `wss://1.peerjs.com`。
 2. **真实 DNS 探测 + TCP 53 自动回退**：启动时自动探测最快 DNS；若校园网/企业网封锁 UDP 53，自动切换 TCP 53。
 3. **系统代理自动回退**：若直连信令失败且环境变量原本配置了代理（如 `HTTPS_PROXY`），会自动回退通过代理连接信令。也可显式传 `-proxy http://127.0.0.1:7890`。
 
-## 3. 多次重连或切换网络 (Wi-Fi <-> 5G)
+## 3. 多人连接与切网重连 (Wi-Fi <-> 5G)
 
-v0.2.0 对多次连接做了彻底重构：
-- **服务端信令常驻不重启**：`expose` 端信令长连接常驻，可同时接待多个客户端（`-max-peers 16`），收到重连 `OFFER` 时毫秒级原地应答，不再出现旧版 `busy pc=..., restarting session` 丢包等待 18 秒的问题。
+- **多人同时在线（Multi-Peer）**：`expose` 端信令长连接常驻，默认支持最多 16 台设备并发连入（`-max-peers 16`）。所有客户端无需手动传 `-id`，使用相同 `-peer` 与 `-secret` 即可并发连接，各自独占原生 UDP 隧道。
 - **网卡切换秒级自愈**：内置网卡 IP 监听，手机在 Wi-Fi 与移动数据间切换时立即触发重连（首次重连仅等待 400ms）。
-- **DataChannel 心跳检测**：每 10 秒发送 `PING`/`PONG` 帧保活 NAT 映射并检测静默死连接。
+- **心跳与保活**：底层 Hysteria 2 / QUIC 与控制通道双重保活，及时检测 NAT 映射断开。
 
-## 4. 卡在 `pc state=connecting`（严格对称 NAT 或 UDP 被禁）
+## 4. 原生 UDP 打洞与传输排查（Hysteria 2 / QUIC）
 
-判断两端 UDP 是否通畅：
-```bash
-nc -u -w3 -z stun.cloudflare.com 3478 && echo UDP-OK
-```
+`v0.5.1` 中 WebRTC SCTP 控制通道仅用于调度，数据在原生 UDP 上直连传输：
+1. **确认 UDP 打洞是否成功**：
+   查看服务端日志中是否出现：
+   ```text
+   expose: punch native UDP (proto=hy2, bandwidth=100 Mbps)...
+   expose: native UDP punched! local=... remote=...
+   expose: native Hysteria 2 server active (Brutal CC 100 Mbps)
+   ```
+2. **两端 UDP 连通性测试**：
+   ```bash
+   nc -u -w3 -z stun.cloudflare.com 3478 && echo UDP-OK
+   ```
+3. **严格对称 NAT 或 UDP 被彻底封锁**：
+   - 可启用 TURN 中继支持（`-turn`）：
+     ```bash
+     p2ptun expose  -id wslssh-a1b2 -secret hunter2 -turn "turn:user:pass@your.turn.server:3478?transport=udp"
+     p2ptun connect -peer wslssh-a1b2 -secret hunter2 -turn "turn:user:pass@your.turn.server:3478?transport=udp"
+     # 若完全封禁 UDP, 可加 -force-relay 与 ?transport=tcp
+     ```
+   - 或回退到 Classic WebRTC DataChannel 模式：`-proto classic`。
 
-- 如果两端都是对称型 NAT（如部分移动运营商 4G/5G CGNAT）或企业防火墙完全封死 UDP：
-  v0.2.0 新增了可选的 **TURN 中继支持**（仅在配置 `-turn` 时启用，未配置时保持 100% 纯 P2P）：
-  ```bash
-  # 两端同时加上 -turn 参数 (支持 udp / tcp / tls TURN):
-  p2ptun expose  -id wslssh-a1b2 -secret hunter2 -turn "turn:user:pass@your.turn.server:3478?transport=udp"
-  p2ptun connect -peer wslssh-a1b2 -secret hunter2 -turn "turn:user:pass@your.turn.server:3478?transport=udp"
-  # 若网络完全禁止 UDP, 可加 -force-relay 与 ?transport=tcp
-  ```
-- 如果服务端所在公网机器做了端口映射或有固定公网 IP，可使用 `-ice-ports 50000-50100 -nat1to1 <公网IP>` 显著提升直连成功率。
+## 5. 权限认证失败 (`bad secret`)
 
-## 5. `peer id already taken` (`ID-TAKEN`)
+若日志中出现：
+`expose: REJECT offer from phone-xxxx: bad secret`
+说明客户端连接时提供的 `-secret` 与服务端的 `-secret` 不一致。服务端会在信令层直接拒接并断开，请核对两端的 `secret` 是否完全一致。
 
-- 当进程被 `kill -9` 强杀或断电时，PeerJS 云服务器可能保留旧 ID 约 15~30 秒。
-- v0.2.0 在正常停止（`Ctrl-C`、`SIGTERM`、`p2ptun stop`）时会自动关闭连接释放 ID；若遇异常断网后的 `ID-TAKEN`，`expose` 端会自动退避等待云端清理后重连，`connect` 端（未指定固定 `-id` 时）会自动轮换新随机 ID 立即连上。
+## 6. `peer id already taken` (`ID-TAKEN`)
+
+- 当进程被强杀或异常掉电时，PeerJS 云服务器可能保留旧 ID 约 15~30 秒。
+- `p2ptun` 正常停止（`Ctrl-C`、`SIGTERM`、`p2ptun stop`）时会自动关闭连接释放 ID；若遇异常断网后的 `ID-TAKEN`，`expose` 端会自动退避等待云端清理后重连，`connect` 端会自动轮换新随机 ID 立即连上。
