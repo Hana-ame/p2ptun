@@ -2,6 +2,8 @@
 # Adjust User/Group and /etc/p2ptun/connect.env, then:
 #   sudo install -m 0644 examples/p2ptun-connect.service /etc/systemd/system/p2ptun-connect.service
 #   sudo systemctl daemon-reload && sudo systemctl enable --now p2ptun-connect
+# Or use the quick installer:
+#   sudo bash scripts/install-systemd.sh connect my-tunnel YOUR_SECRET 127.0.0.1:2222
 
 [Unit]
 Description=p2ptun connect daemon (P2P TCP tunnel client)
@@ -11,8 +13,8 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-User=YOURUSER
-Group=YOURGROUP
+User=root
+Group=root
 EnvironmentFile=/etc/p2ptun/connect.env
 ExecStart=/usr/local/bin/p2ptun connect
 ExecReload=/bin/kill -HUP $MAINPID

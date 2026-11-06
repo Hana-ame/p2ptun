@@ -1,9 +1,9 @@
-# Example systemd unit for the expose side (server / WSL).
+# Example systemd unit for the expose side (server / WSL / Cloud host).
 # Adjust User/Group and the env file path, then:
 #   sudo install -m 0644 examples/p2ptun.service /etc/systemd/system/p2ptun.service
 #   sudo systemctl daemon-reload && sudo systemctl enable --now p2ptun
-# Or use:
-#   sudo bash scripts/install-systemd.sh expose -id wslssh-a1b2 -secret YOUR_SECRET
+# Or use the quick installer:
+#   sudo bash scripts/install-systemd.sh expose my-tunnel YOUR_SECRET 127.0.0.1:22
 
 [Unit]
 Description=p2ptun expose daemon (P2P TCP tunnel server)
@@ -13,8 +13,8 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-User=YOURUSER
-Group=YOURGROUP
+User=root
+Group=root
 EnvironmentFile=/etc/p2ptun/env
 ExecStart=/usr/local/bin/p2ptun expose
 ExecReload=/bin/kill -HUP $MAINPID

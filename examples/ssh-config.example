@@ -1,0 +1,26 @@
+# ~/.ssh/config 进阶接入示例 (examples/ssh-config.example)
+#
+# 场景 1: p2ptun 客户端已经在后台常驻监听 127.0.0.1:2222
+# -------------------------------------------------------------
+# 此时直接通过端口映射访问:
+#
+# Host my-wsl
+#     HostName 127.0.0.1
+#     Port 2222
+#     User root
+#     ServerAliveInterval 15
+#     ServerAliveCountMax 3
+#
+# 之后在终端只需输入:
+#   ssh my-wsl
+
+# 场景 2: 免常驻本地端口，使用 ProxyCommand 自动化按需穿透
+# -------------------------------------------------------------
+# 若客户端机器上安装了 nc (netcat) 或 socat:
+#
+# Host my-wsl-ondemand
+#     HostName 127.0.0.1
+#     Port 2222
+#     User root
+#     ProxyCommand nc 127.0.0.1 2222
+#
