@@ -44,6 +44,25 @@ p2ptun status
 p2ptun stop
 ```
 
+## 核心工作原理 (How It Works)
+
+传统 P2P 穿透（如原生 WebRTC DataChannel）常受制于 SCTP 协议栈的 1 秒最小 RTO 与双重加解密开销，一旦遭遇跨网、跨国丢包，传输速率便会出现断崖式暴跌。
+
+`p2ptun` 采用 **调度面与数据面彻底解耦** 的创新机制：
+
+1. **信令发现与防扫描（Signaling Phase）**：
+   通过公共 PeerJS 集群（`0.peerjs.com`）交换 WebRTC SDP。呼叫元数据中附带用户的 `SECRET`，服务端校验不匹配直接断开（Reject），完全杜绝未授权端口扫描。
+2. **SCTP 控制信道调度（Coordination Phase）**：
+   WebRTC 握手成功后仅建立一条专职控制信道（`p2ptun-control`），**完全不经过业务数据**，专职用于协议协商、目标带宽确认及交换底层独立的原生 ICE 打洞凭证。
+3. **原生裸 UDP 打洞（Punching Phase）**：
+   双方底层由独立的 `pion/ice.Agent` 发起对向 STUN 探测，在公网两端直接打通专属的 **原生裸 UDP 5-tuple 套接字**，彻底脱离 WebRTC 协议栈与 DTLS/SCTP。
+4. **Hysteria 2 Brutal 拥塞控制（Transport Phase）**：
+   在裸 UDP 套接字上直接运行官方 Hysteria 2 内核。无论网络延迟多高、丢包多严重，均按照设定的目标带宽（如 `-bandwidth 100`）**恒定发包并不做丢包退避**，配合极速选择性重传（SACK），彻底跑满物理带宽上限。
+5. **多人并发连接（Multi-Peer）**：
+   服务端 `exposeManager` 常驻运行。客户端无需手动指定 `-id`（自动随机分配），多台设备可并发呼叫同一个服务端 `-peer`，各自独立打洞并独占一条原生 UDP 隧道，互不干扰。
+
+> 📖 详细系统架构、时序图、Brutal 数学模型与自愈原理请参阅 [docs/architecture.md](docs/architecture.md)。
+
 ## Security & Architecture Concepts
 
 - **`ID` (`-id` / `-peer`)**：公共信令网（PeerJS）上的寻址标识（类似于电话号码）。客户端如果不指定 `-id`，会自动生成唯一的随机 ID（如 `phone-3b881fe7`），因此多台设备可并发呼叫同一个服务端 `-peer` 而不产生冲突。
