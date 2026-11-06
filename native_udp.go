@@ -220,7 +220,7 @@ func runNativeUDPExposeWithChan(sessCtx context.Context, cfg config, dc *webrtc.
 		sessCtx = context.Background()
 	}
 
-	log.Printf("expose: SCTP control channel open, coordinating native UDP...")
+	log.Printf("expose: [控制信道已建立] SCTP 控制通道开启 (p2ptun-control)，正在协调原生 UDP 穿透打洞...")
 
 	agent, err := buildICEAgent(cfg)
 	if err != nil {
@@ -319,10 +319,10 @@ func runNativeUDPExposeWithChan(sessCtx context.Context, cfg config, dc *webrtc.
 	case <-readyCh:
 	}
 
-	log.Printf("expose: punch native UDP (proto=%s, bandwidth=%d Mbps)...", protoChoice, bwMbps)
+	log.Printf("expose: [开始打洞] 正在向客户端发起原生 UDP 穿透 (协议: %s, 目标带宽: %d Mbps)...", protoChoice, bwMbps)
 	iceConn, err := agent.Accept(ctx, remoteUfrag, remotePwd)
 	if err != nil {
-		log.Printf("expose: native UDP accept failed: %v", err)
+		log.Printf("expose: 原生 UDP 打洞失败 (accept failed): %v", err)
 		return
 	}
 	defer iceConn.Close()
@@ -332,7 +332,7 @@ func runNativeUDPExposeWithChan(sessCtx context.Context, cfg config, dc *webrtc.
 		remoteStr = iceConn.RemoteAddr().String()
 	}
 	globalStats.setTransport(protoChoice, remoteStr)
-	log.Printf("expose: native UDP punched! local=%s remote=%s", iceConn.LocalAddr(), iceConn.RemoteAddr())
+	log.Printf("expose: [P2P直连成功] 原生 UDP 物理通道直连打通! 本地=%s <===> 对端=%s", iceConn.LocalAddr(), iceConn.RemoteAddr())
 	pConn := &icePacketConn{conn: iceConn}
 
 	if protoChoice == "quic" {
@@ -349,7 +349,7 @@ func runNativeUDPConnect(s *tunnelSess, dc *webrtc.DataChannel) {
 }
 
 func runNativeUDPConnectWithChan(s *tunnelSess, dc *webrtc.DataChannel, msgCh <-chan webrtc.DataChannelMessage, openCh <-chan struct{}) {
-	log.Printf("connect: SCTP control channel open, coordinating native UDP...")
+	log.Printf("connect: [控制信道已建立] SCTP 控制通道开启 (p2ptun-control)，正在协调原生 UDP 穿透打洞...")
 
 	sessCtx := s.ctx
 	if sessCtx == nil {
@@ -456,10 +456,10 @@ func runNativeUDPConnectWithChan(s *tunnelSess, dc *webrtc.DataChannel, msgCh <-
 	case <-readyCh:
 	}
 
-	log.Printf("connect: dialing native UDP to peer (proto=%s, bandwidth=%d Mbps)...", protoChoice, bwMbps)
+	log.Printf("connect: [开始打洞] 正在向服务端发起原生 UDP 穿透 (协议: %s, 目标带宽: %d Mbps)...", protoChoice, bwMbps)
 	iceConn, err := agent.Dial(ctx, remoteUfrag, remotePwd)
 	if err != nil {
-		log.Printf("connect: native UDP dial failed: %v", err)
+		log.Printf("connect: 原生 UDP 打洞失败 (dial failed): %v", err)
 		s.cancelFn()
 		return
 	}
@@ -470,7 +470,7 @@ func runNativeUDPConnectWithChan(s *tunnelSess, dc *webrtc.DataChannel, msgCh <-
 		remoteStr = iceConn.RemoteAddr().String()
 	}
 	globalStats.setTransport(protoChoice, remoteStr)
-	log.Printf("connect: native UDP punched! local=%s remote=%s", iceConn.LocalAddr(), iceConn.RemoteAddr())
+	log.Printf("connect: [P2P直连成功] 原生 UDP 物理通道直连打通! 本地=%s <===> 对端=%s", iceConn.LocalAddr(), iceConn.RemoteAddr())
 	pConn := &icePacketConn{conn: iceConn}
 
 	if protoChoice == "quic" {
@@ -514,7 +514,7 @@ func runNativeHy2Expose(ctx context.Context, cfg config, pConn net.PacketConn, b
 		}()
 	}
 
-	log.Printf("expose: native Hysteria 2 server active (Brutal CC %d Mbps)", bwMbps)
+	log.Printf("expose: [隧道就绪] 原生 Hysteria 2 服务端已激活 (Brutal 恒定发包: %d Mbps)", bwMbps)
 	_ = srv.Serve()
 }
 
@@ -540,7 +540,15 @@ func runNativeHy2Connect(s *tunnelSess, pConn net.PacketConn, bwMbps int) {
 		s.cancelFn()
 		return
 	}
-	log.Printf("connect: native Hysteria 2 handshake success! (Brutal CC %d Mbps, tx=%d bps)", bwMbps, info.Tx)
+	log.Printf("connect: [隧道就绪] 原生 Hysteria 2 握手成功! (Brutal 恒定发包: %d Mbps, tx=%d bps)", bwMbps, info.Tx)
+	if s.cfg.listen != "" {
+		tipPort := portOf(s.cfg.listen)
+		if tipPort == "22" || tipPort == "2222" {
+			log.Printf("connect: [使用提示] 本地监听 %s 已就绪，连接命令 ➔ ssh -p %s user@127.0.0.1", s.cfg.listen, tipPort)
+		} else {
+			log.Printf("connect: [使用提示] 本地监听 %s 已就绪，测试代理命令 ➔ curl -x http://127.0.0.1:%s -I https://www.google.com", s.cfg.listen, tipPort)
+		}
+	}
 
 	s.hy2Mu.Lock()
 	s.hy2Client = cli
@@ -591,7 +599,7 @@ func runNativeQUICExpose(ctx context.Context, cfg config, pConn net.PacketConn) 
 	}
 	defer listener.Close()
 
-	log.Printf("expose: native QUIC server active (ALPN=%s)", alpn)
+	log.Printf("expose: [隧道就绪] 原生 QUIC 服务端已激活 (TLS 1.3 多路复用, ALPN=%s)", alpn)
 
 	qConn, err := listener.Accept(ctx)
 	if err != nil {
@@ -666,7 +674,15 @@ func runNativeQUICConnect(s *tunnelSess, pConn net.PacketConn) {
 	}
 	defer qConn.CloseWithError(0, "bye")
 
-	log.Printf("connect: native QUIC handshake success! (ALPN=%s)", alpn)
+	log.Printf("connect: [隧道就绪] 原生 QUIC 握手成功! (TLS 1.3 多路复用, ALPN=%s)", alpn)
+	if s.cfg.listen != "" {
+		tipPort := portOf(s.cfg.listen)
+		if tipPort == "22" || tipPort == "2222" {
+			log.Printf("connect: [使用提示] 本地监听 %s 已就绪，连接命令 ➔ ssh -p %s user@127.0.0.1", s.cfg.listen, tipPort)
+		} else {
+			log.Printf("connect: [使用提示] 本地监听 %s 已就绪，测试代理命令 ➔ curl -x http://127.0.0.1:%s -I https://www.google.com", s.cfg.listen, tipPort)
+		}
+	}
 
 	s.quicMu.Lock()
 	s.quicConn = qConn

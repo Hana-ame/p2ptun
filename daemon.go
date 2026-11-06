@@ -475,7 +475,7 @@ func runStatusCmd(args []string) {
 				if len(lines) > 10 {
 					lines = lines[len(lines)-10:]
 				}
-				fmt.Println("--- recent logs ---")
+				fmt.Println("--- 最近运行日志 (Recent logs) ---")
 				for _, ln := range lines {
 					fmt.Println(ln)
 				}

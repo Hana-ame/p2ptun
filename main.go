@@ -43,10 +43,10 @@ func main() {
 	}
 	switch os.Args[1] {
 	case "expose":
-		log.Printf("p2ptun %s started (DNS: %s)", version, strings.Join(getActiveDNS(), ", "))
+		log.Printf("p2ptun %s 已启动 (活跃 DNS: %s)", version, strings.Join(getActiveDNS(), ", "))
 		runExpose(os.Args[2:])
 	case "connect":
-		log.Printf("p2ptun %s started (DNS: %s)", version, strings.Join(getActiveDNS(), ", "))
+		log.Printf("p2ptun %s 已启动 (活跃 DNS: %s)", version, strings.Join(getActiveDNS(), ", "))
 		runConnect(os.Args[2:])
 	case "status":
 		runStatusCmd(os.Args[2:])
@@ -713,7 +713,7 @@ func (m *exposeManager) removeSession(sess *exposeSession) {
 }
 
 func (m *exposeManager) run() {
-	log.Printf("expose: id=%s target=%s proto=%s bandwidth=%dMbps brokers=%s max-peers=%d secret=***",
+	log.Printf("expose: [启动配置] 节点ID=%s 目标服务=%s 协议=%s 目标带宽=%dMbps (信令服=%s, 最大并发数=%d)",
 		m.cfg.id, m.cfg.target, m.cfg.effectiveProto(), m.cfg.bandwidthMbps, strings.Join(m.cfg.brokers, ","), m.cfg.maxPeers)
 	defer m.closeAllSessions(true)
 
@@ -748,7 +748,7 @@ func (m *exposeManager) run() {
 		}
 		attempt++
 		globalStats.reconnects.Add(1)
-		log.Printf("expose: signaling disconnected: %v (reconnect in %v)", err, wait.Round(100*time.Millisecond))
+		log.Printf("expose: [信令断开] 与信令服务器断开: %v (将在 %v 后自动尝试重连...)", err, wait.Round(100*time.Millisecond))
 
 		select {
 		case <-m.stop:
@@ -801,9 +801,13 @@ func (m *exposeManager) runSignalingLoop() error {
 
 	globalStats.signalingUp.Store(true)
 	globalStats.currentBroker.Store(sc.broker)
-	log.Printf("expose: signaling ready id=%s broker=%s", m.cfg.id, sc.broker)
-	log.Printf("expose: connect side command: p2ptun connect -peer %s -secret <SECRET> -listen 127.0.0.1:2222 -proto %s -bandwidth %d",
-		m.cfg.id, m.cfg.effectiveProto(), m.cfg.bandwidthMbps)
+	log.Printf("expose: [信令就绪] 已连入信令服务器 (节点ID: %s, Broker: %s)", m.cfg.id, sc.broker)
+	defPort := portOf(m.cfg.target)
+	if defPort == "" {
+		defPort = "1080"
+	}
+	log.Printf("expose: [客户端连接命令] ➔ p2ptun connect -peer %s -secret <SECRET> -listen 127.0.0.1:%s -proto %s -bandwidth %d",
+		m.cfg.id, defPort, m.cfg.effectiveProto(), m.cfg.bandwidthMbps)
 
 	select {
 	case <-m.stop:
@@ -847,7 +851,7 @@ func (m *exposeManager) handleSignal(typ, src string, sig pjSignal) {
 	switch typ {
 	case pjOffer:
 		if sig.Metadata != m.cfg.secret {
-			log.Printf("expose: REJECT offer from %s: bad secret", src)
+			log.Printf("expose: [安全拒绝] 拒绝来自客户端 %s 的呼叫请求: 密码错误 (Bad secret)", src)
 			if sc := m.getSc(); sc != nil {
 				sc.sendLeave(src, sig.ConnectionID)
 			}
@@ -862,7 +866,7 @@ func (m *exposeManager) handleSignal(typ, src string, sig pjSignal) {
 
 	case pjLeave:
 		if sess := m.findSession(src, sig.ConnectionID); sess != nil {
-			log.Printf("expose: peer %s (conn=%s) sent LEAVE, closing session", src, sig.ConnectionID)
+			log.Printf("expose: [客户端断开] 客户端 %s (conn=%s) 已主动断开连接", src, sig.ConnectionID)
 			sess.close()
 		}
 	}
@@ -891,13 +895,13 @@ func (m *exposeManager) acceptOffer(src string, sig pjSignal) {
 	}
 	if len(m.sessions) >= m.cfg.maxPeers {
 		m.mu.Unlock()
-		log.Printf("expose: max peers (%d) reached, rejecting OFFER from %s", m.cfg.maxPeers, src)
+		log.Printf("expose: [并发受限] 已达最大客户端并发上限 (%d)，拒绝客户端 %s 的接入请求", m.cfg.maxPeers, src)
 		return
 	}
 	m.mu.Unlock()
 
 	for _, old := range stale {
-		log.Printf("expose: replacing stale session %s for fresh OFFER", old.key)
+		log.Printf("expose: 客户端 %s 发起新连接，正在就地平滑复位旧会话 (%s)...", src, old.key)
 		old.close()
 	}
 
@@ -930,7 +934,7 @@ func (m *exposeManager) acceptOffer(src string, sig pjSignal) {
 
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
 		if dc.Label() == controlDataChannelLabel {
-			log.Printf("expose: [%s] control datachannel registered (label=%s)", key, dc.Label())
+			log.Printf("expose: [%s] WebRTC 控制通道已建立 (label=%s)", key, dc.Label())
 			sess.dcOpened.Store(true)
 			msgCh, openCh := wireControlChannel(dc)
 			dc.OnClose(func() {
@@ -1005,7 +1009,7 @@ func (m *exposeManager) acceptOffer(src string, sig pjSignal) {
 		}
 	}()
 
-	log.Printf("expose: OFFER from %s conn=%s (active peers=%d)", src, sig.ConnectionID, peerCount)
+	log.Printf("expose: [收到呼叫] 收到客户端连接请求 [来自: %s, conn=%s] (当前在线人数: %d)", src, sig.ConnectionID, peerCount)
 	if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: sig.SDP.SDP}); err != nil {
 		log.Printf("expose: [%s] setRemoteDescription: %v", key, err)
 		sess.close()
@@ -1124,7 +1128,7 @@ func runConnect(args []string) {
 	}
 	defer cleanup()
 
-	log.Printf("connect: id=%s peer=%s listen=%s proto=%s bandwidth=%dMbps brokers=%s on-demand=%v secret=***",
+	log.Printf("connect: [启动配置] 本机ID=%s 目标服务端=%s 本地监听=%s 传输协议=%s 目标带宽=%dMbps (信令服=%s, on-demand=%v)",
 		cfg.id, cfg.peer, cfg.listen, cfg.effectiveProto(), cfg.bandwidthMbps, strings.Join(cfg.brokers, ","), cfg.onDemand)
 
 	lis, err := net.Listen("tcp", cfg.listen)
@@ -1132,7 +1136,12 @@ func runConnect(args []string) {
 		log.Fatalf("connect: listen %s: %v", cfg.listen, err)
 	}
 	defer lis.Close()
-	log.Printf("connect: listening on %s (ssh -p %s user@127.0.0.1)", cfg.listen, portOf(cfg.listen))
+	portStr := portOf(cfg.listen)
+	tipStr := fmt.Sprintf("代理测试命令: curl -x http://127.0.0.1:%s -I https://www.google.com", portStr)
+	if portStr == "22" || portStr == "2222" {
+		tipStr = fmt.Sprintf("SSH 命令: ssh -p %s user@127.0.0.1", portStr)
+	}
+	log.Printf("connect: [本地监听就绪] 正在监听 %s (%s)", cfg.listen, tipStr)
 
 	stop := make(chan struct{})
 	var stopOnce sync.Once
@@ -1199,7 +1208,7 @@ func runConnect(args []string) {
 	}()
 
 	go watchNetworkChanges(stop, 5*time.Second, func(oldFP, newFP string) {
-		log.Printf("connect: local network changed (%s -> %s), reconnecting immediately", oldFP, newFP)
+		log.Printf("connect: [网卡自愈] 检测到本机网络接口切换 (%s -> %s)，正在就地发起 400ms 热重连...", oldFP, newFP)
 		forceReconnect()
 	})
 
@@ -1414,7 +1423,7 @@ func (s *tunnelSess) run() error {
 		dc, err = pc.CreateDataChannel(controlDataChannelLabel, &webrtc.DataChannelInit{Ordered: boolPtr(true)})
 		if err == nil {
 			ctrlMsgCh, ctrlOpenCh = wireControlChannel(dc, func() {
-				log.Printf("connect: datachannel open (conn=%s, label=%s)", s.connID, dc.Label())
+				log.Printf("connect: [WebRTC控制信道开启] WebRTC 控制通道建立成功 (conn=%s, label=%s)", s.connID, dc.Label())
 				s.lastActive.Store(time.Now().UnixNano())
 				go runNativeUDPConnectWithChan(s, dc, ctrlMsgCh, ctrlOpenCh)
 			})
@@ -1547,7 +1556,7 @@ func (s *tunnelSess) run() error {
 		sc.shutdown()
 	}()
 
-	log.Printf("connect: signaling ready (%s), sending OFFER to %s (conn=%s)", sc.broker, s.peer, s.connID)
+	log.Printf("connect: [信令就绪] 已连接信令服务器 (%s)，正在向目标服务端 [%s] 发起呼叫 (conn=%s)...", sc.broker, s.peer, s.connID)
 	offer, err := pc.CreateOffer(nil)
 	if err != nil {
 		return err
@@ -1589,7 +1598,7 @@ func (s *tunnelSess) onSignal(typ, src string, sig pjSignal, sdp *sdpState) {
 		if sdp.remoteLocked() {
 			return
 		}
-		log.Printf("connect: ANSWER from %s (conn=%s)", src, s.connID)
+		log.Printf("connect: [收到应答] 服务端 [%s] 已接受连接请求 (收到 ANSWER, conn=%s)", src, s.connID)
 		if err := s.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: sig.SDP.SDP}); err != nil {
 			log.Printf("connect: setRemoteDescription: %v", err)
 			s.cancelFn()

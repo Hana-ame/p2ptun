@@ -56,11 +56,17 @@ journalctl -u p2ptun -n 50 --no-pager
 
 `v0.5.1` 中 WebRTC SCTP 控制通道仅用于调度，数据在原生 UDP 上直连传输：
 1. **确认 UDP 打洞是否成功**：
-   查看服务端日志中是否出现：
+   查看服务端与客户端日志中是否出现直连成功标志：
    ```text
-   expose: punch native UDP (proto=hy2, bandwidth=100 Mbps)...
-   expose: native UDP punched! local=... remote=...
-   expose: native Hysteria 2 server active (Brutal CC 100 Mbps)
+   # 服务端标志:
+   expose: [开始打洞] 正在向客户端发起原生 UDP 穿透 (协议: hy2, 目标带宽: 100 Mbps)...
+   expose: [P2P直连成功] 原生 UDP 物理通道直连打通! 本地=198.51.100.50:59990 <===> 对端=203.0.113.88:1570
+   expose: [隧道就绪] 原生 Hysteria 2 服务端已激活 (Brutal 恒定发包: 100 Mbps)
+
+   # 客户端标志:
+   connect: [P2P直连成功] 原生 UDP 物理通道直连打通! 本地=... <===> 对端=...
+   connect: [隧道就绪] 原生 Hysteria 2 握手成功! (Brutal 恒定发包: 100 Mbps)
+   connect: [使用提示] 本地监听 127.0.0.1:1080 已就绪，流量正通过 P2P 原生 UDP 直连转发
    ```
 2. **两端 UDP 连通性测试**：
    ```bash
