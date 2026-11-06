@@ -492,3 +492,95 @@ func TestEndToEndMultiStreamAndRapidReconnections(t *testing.T) {
 		close(connStop)
 	}
 }
+
+func TestUnifiedIDAndPeerFlags(t *testing.T) {
+	// 1. Expose with -id
+	cfg, err := parseConfig([]string{"-id", "tun-expo-1", "-secret", "sec1"}, "expose")
+	if err != nil || cfg.id != "tun-expo-1" || !cfg.idExplicit {
+		t.Fatalf("expose -id failed: cfg.id=%q, explicit=%v, err=%v", cfg.id, cfg.idExplicit, err)
+	}
+
+	// 2. Expose with -peer (interchangeable)
+	cfg, err = parseConfig([]string{"-peer", "tun-expo-2", "-secret", "sec1"}, "expose")
+	if err != nil || cfg.id != "tun-expo-2" || !cfg.idExplicit {
+		t.Fatalf("expose -peer failed: cfg.id=%q, explicit=%v, err=%v", cfg.id, cfg.idExplicit, err)
+	}
+
+	// 3. Expose with -name
+	cfg, err = parseConfig([]string{"-name", "tun-expo-3", "-secret", "sec1"}, "expose")
+	if err != nil || cfg.id != "tun-expo-3" || !cfg.idExplicit {
+		t.Fatalf("expose -name failed: cfg.id=%q, explicit=%v, err=%v", cfg.id, cfg.idExplicit, err)
+	}
+
+	// 4. Expose with positional arg at start
+	cfg, err = parseConfig([]string{"tun-expo-4", "-secret", "sec1"}, "expose")
+	if err != nil || cfg.id != "tun-expo-4" || !cfg.idExplicit {
+		t.Fatalf("expose posArg start failed: cfg.id=%q, explicit=%v, err=%v", cfg.id, cfg.idExplicit, err)
+	}
+
+	// 5. Expose with positional arg at end
+	cfg, err = parseConfig([]string{"-secret", "sec1", "tun-expo-5"}, "expose")
+	if err != nil || cfg.id != "tun-expo-5" || !cfg.idExplicit {
+		t.Fatalf("expose posArg end failed: cfg.id=%q, explicit=%v, err=%v", cfg.id, cfg.idExplicit, err)
+	}
+
+	// 6. Connect with -peer
+	cfg, err = parseConfig([]string{"-peer", "target-srv-1", "-secret", "sec1"}, "connect")
+	if err != nil || cfg.peer != "target-srv-1" || !strings.HasPrefix(cfg.id, "phone-") {
+		t.Fatalf("connect -peer failed: cfg.peer=%q, cfg.id=%q, err=%v", cfg.peer, cfg.id, err)
+	}
+
+	// 7. Connect with -id (user's exact issue - should set target peer, NOT fail!)
+	cfg, err = parseConfig([]string{"-id", "target-srv-2", "-secret", "sec1"}, "connect")
+	if err != nil || cfg.peer != "target-srv-2" || !strings.HasPrefix(cfg.id, "phone-") {
+		t.Fatalf("connect -id failed: cfg.peer=%q, cfg.id=%q, err=%v", cfg.peer, cfg.id, err)
+	}
+
+	// 8. Connect with -name
+	cfg, err = parseConfig([]string{"-name", "target-srv-3", "-secret", "sec1"}, "connect")
+	if err != nil || cfg.peer != "target-srv-3" || !strings.HasPrefix(cfg.id, "phone-") {
+		t.Fatalf("connect -name failed: cfg.peer=%q, cfg.id=%q, err=%v", cfg.peer, cfg.id, err)
+	}
+
+	// 9. Connect with positional arg at start
+	cfg, err = parseConfig([]string{"target-srv-4", "-secret", "sec1"}, "connect")
+	if err != nil || cfg.peer != "target-srv-4" || !strings.HasPrefix(cfg.id, "phone-") {
+		t.Fatalf("connect posArg start failed: cfg.peer=%q, cfg.id=%q, err=%v", cfg.peer, cfg.id, err)
+	}
+
+	// 10. Connect with positional arg at end
+	cfg, err = parseConfig([]string{"-secret", "sec1", "target-srv-5"}, "connect")
+	if err != nil || cfg.peer != "target-srv-5" || !strings.HasPrefix(cfg.id, "phone-") {
+		t.Fatalf("connect posArg end failed: cfg.peer=%q, cfg.id=%q, err=%v", cfg.peer, cfg.id, err)
+	}
+
+	// 11. Connect with BOTH -peer (target) and -id (client ID)
+	cfg, err = parseConfig([]string{"-peer", "srv-target", "-id", "my-client-laptop", "-secret", "sec1"}, "connect")
+	if err != nil || cfg.peer != "srv-target" || cfg.id != "my-client-laptop" || !cfg.idExplicit {
+		t.Fatalf("connect -peer & -id failed: cfg.peer=%q, cfg.id=%q, explicit=%v, err=%v", cfg.peer, cfg.id, cfg.idExplicit, err)
+	}
+
+	// 12. Connect with positional (target) and -id (client ID)
+	cfg, err = parseConfig([]string{"srv-target", "-id", "my-client-laptop", "-secret", "sec1"}, "connect")
+	if err != nil || cfg.peer != "srv-target" || cfg.id != "my-client-laptop" || !cfg.idExplicit {
+		t.Fatalf("connect pos & -id failed: cfg.peer=%q, cfg.id=%q, explicit=%v, err=%v", cfg.peer, cfg.id, cfg.idExplicit, err)
+	}
+
+	// 13. Connect with missing peer/id -> error with helpful prompt
+	_, err = parseConfig([]string{"-secret", "sec1"}, "connect")
+	if err == nil || !strings.Contains(err.Error(), "请指定目标隧道名称") {
+		t.Fatalf("expected helpful missing peer error, got: %v", err)
+	}
+
+	// 14. Environment variable interop test
+	t.Setenv("P2PTUN_NAME", "env-tun-name")
+	cfg, err = parseConfig([]string{"-secret", "sec1"}, "expose")
+	if err != nil || cfg.id != "env-tun-name" {
+		t.Fatalf("P2PTUN_NAME in expose failed: %v, id=%s", err, cfg.id)
+	}
+
+	cfg, err = parseConfig([]string{"-secret", "sec1"}, "connect")
+	if err != nil || cfg.peer != "env-tun-name" {
+		t.Fatalf("P2PTUN_NAME in connect failed: %v, peer=%s", err, cfg.peer)
+	}
+}

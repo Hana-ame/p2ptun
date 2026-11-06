@@ -32,12 +32,18 @@ Client (Termux / Windows / Mac)         Server (WSL / Cloud Shell / VPS)
 
 ```sh
 # 1. 服务端 (如 WSL / Linux 服务器，暴露 127.0.0.1:22，默认 Hysteria 2 恒定带宽)
+# 隧道名可直接作为位置参数，或通过 -id / -peer / -name 传入（完全等价，零记忆负担）
 # 注意: 默认不开启控制面板 HTTP 端口; 若需要 Web 监控可加 -status-addr 127.0.0.1:18222
-P2PTUN_ID=wslssh-a1b2 P2PTUN_SECRET=hunter2 p2ptun expose -proto hy2 -bandwidth 100 -daemon
+p2ptun expose my-tunnel -secret hunter2 -proto hy2 -bandwidth 100 -daemon
 
 # 2. 客户端 (如 Termux / 笔记本) — 随后执行: ssh -p 2222 user@127.0.0.1
+# 目标隧道名直接跟在 connect 后面即可，也可使用 -id / -peer / -name
 # 支持多台设备同时并发连接同一个服务端 (默认支持最多 16 台设备)
-P2PTUN_PEER=wslssh-a1b2 P2PTUN_SECRET=hunter2 p2ptun connect -listen 127.0.0.1:2222 -proto hy2 -bandwidth 100 -daemon
+p2ptun connect my-tunnel -secret hunter2 -listen 127.0.0.1:2222 -proto hy2 -bandwidth 100 -daemon
+
+# 环境变量也完全通用互通 (P2PTUN_NAME / P2PTUN_ID / P2PTUN_PEER 均可):
+# P2PTUN_NAME=my-tunnel P2PTUN_SECRET=hunter2 p2ptun expose -daemon
+# P2PTUN_NAME=my-tunnel P2PTUN_SECRET=hunter2 p2ptun connect -listen 127.0.0.1:2222 -daemon
 
 # 3. 查看运行状态 / 活跃协议 / 原生 UDP 地址 / RTT 或停止守护进程
 p2ptun status
@@ -65,7 +71,9 @@ p2ptun stop
 
 ## Security & Architecture Concepts
 
-- **`ID` (`-id` / `-peer`)**：公共信令网（PeerJS）上的寻址标识（类似于电话号码）。客户端如果不指定 `-id`，会自动生成唯一的随机 ID（如 `phone-3b881fe7`），因此多台设备可并发呼叫同一个服务端 `-peer` 而不产生冲突。
+- **`ID` (`-id` / `-peer` / `-name` / 直接传参)**：隧道唯一标识名称。
+  - **零认知负荷**：在 `expose` 与 `connect` 两端完全通用互通！既可直接跟在命令后作为位置参数（`p2ptun expose my-tunnel` / `p2ptun connect my-tunnel`），也可使用 `-id`、`-peer` 或 `-name`。
+  - **多端防冲突**：客户端连入时无需显式为本机分配 ID，系统会自动生成唯一客户端标识（如 `phone-3b881fe7`），多台设备可并发连接同一个目标隧道而不产生任何碰撞。
 - **`SECRET` (`-secret`)**：两端配对密钥与通行证。
   1. **信令防扫描**：信令协商时首先比对密钥，不匹配直接拒接（Reject），拒绝建立 WebRTC 连接。
   2. **传输加密认证**：在打洞成功的原生 UDP 上握手时，Hysteria 2 / QUIC 再次验证密钥，双重保障隧道安全。
@@ -75,9 +83,8 @@ p2ptun stop
 
 | Flag | Env | Description |
 |---|---|---|
-| `-id` | `P2PTUN_ID` | Peer ID on the signaling server |
+| `<NAME>` / `-id` / `-peer` / `-name` | `P2PTUN_NAME` / `P2PTUN_ID` / `P2PTUN_PEER` | 隧道标识/名称（`expose` 与 `connect` 完全通用互通，零记忆负担） |
 | `-secret` | `P2PTUN_SECRET` | Pairing secret (must match on both sides) |
-| `-peer` | `P2PTUN_PEER` | Remote expose peer ID (`connect` side) |
 | `-target` | `P2PTUN_TARGET` | Exposed TCP endpoint (`expose`, default `127.0.0.1:22`) |
 | `-listen` | `P2PTUN_LISTEN` | Local listen addr (`connect`, default `127.0.0.1:2222`) |
 | `-proto` | `P2PTUN_PROTO` | Transport protocol: `hy2` (Hysteria 2 Brutal CC, default), `quic` (Native QUIC), `classic` |

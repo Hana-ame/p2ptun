@@ -48,7 +48,7 @@ journalctl -u p2ptun -n 50 --no-pager
 
 ## 3. 多人连接与切网重连 (Wi-Fi <-> 5G)
 
-- **多人同时在线（Multi-Peer）**：`expose` 端信令长连接常驻，默认支持最多 16 台设备并发连入（`-max-peers 16`）。所有客户端无需手动传 `-id`，使用相同 `-peer` 与 `-secret` 即可并发连接，各自独占原生 UDP 隧道。
+- **多人同时在线（Multi-Peer）**：`expose` 端信令长连接常驻，默认支持最多 16 台设备并发连入（`-max-peers 16`）。所有客户端直接使用相同隧道名（`p2ptun connect <隧道名> -secret <SECRET>`，支持位置参数或 `-id`/`-peer`/`-name`）即可并发连接，各自独占原生 UDP 隧道，零心智负担。
 - **网卡切换秒级自愈**：内置网卡 IP 监听，手机在 Wi-Fi 与移动数据间切换时立即触发重连（首次重连仅等待 400ms）。
 - **心跳与保活**：底层 Hysteria 2 / QUIC 与控制通道双重保活，及时检测 NAT 映射断开。
 

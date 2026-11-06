@@ -102,8 +102,8 @@ Client (connect)                     Signaling (PeerJS)                  Server 
 ```
 
 ### 阶段 1：公共信令发现与防扫描过滤（Signaling Phase）
-1. **服务端挂牌**：服务端连入 PeerJS 公共集群（`wss://0.peerjs.com` 等），注册用户指定的 `-id`（如 `goproxy-tunnel`）。
-2. **客户端呼叫**：客户端发起连接，生成本地临时 ID（如 `phone-3b881fe7`），向信令服发送呼叫 `OFFER`，目标指向 `-peer goproxy-tunnel`。
+1. **服务端挂牌**：服务端连入 PeerJS 公共集群（`wss://0.peerjs.com` 等），注册用户指定的隧道名称（如 `p2ptun expose goproxy-tunnel`，也支持 `-id` / `-peer` / `-name`）。
+2. **客户端呼叫**：客户端发起连接（如 `p2ptun connect goproxy-tunnel`，也支持 `-id` / `-peer` / `-name`），系统自动生成本地独立客户端 ID（如 `phone-3b881fe7`），向信令服发送呼叫 `OFFER`，目标指向该隧道。
 3. **信令防扫描校验**：客户端在 `OFFER` 的 `metadata` 中附带用户的 `-secret`。服务端收到后先校验密钥：
    * 若密钥不符，服务端**立即向信令服发送 `LEAVE` 并丢弃该连接**，绝对不触发 WebRTC 握手，使恶意扫描者连端口和协议特征都探测不到。
    * 若密钥正确，服务端创建独立会话 `exposeSession` 并回复 `ANSWER`。
@@ -205,9 +205,10 @@ Client (connect)                     Signaling (PeerJS)                  Server 
 * 服务端信令长连接**永久保持在线**，不随客户端的接入或断开而退出。
 * 维护动态会话表 `sessions: map[string]*exposeSession`，默认支持多达 16 台设备同时接入（启动时可通过 `-max-peers 50` 调大）。
 
-### 6.2 客户端动态匿名 ID 机制
-* 客户端启动时**无需手动指定 `-id`**，系统自动为其生成全局唯一的随机 ID（格式如 `phone-3b881fe7`）。
-* 因此，家庭电脑、办公笔记本、多部手机可以同时执行同一条连接命令呼叫同一个服务端 `-peer goproxy-tunnel`，绝不发生信令 ID 碰撞。
+### 6.2 客户端零配置与动态匿名 ID 机制（零认知负荷）
+* 隧道名称完全归一化：无论是 `expose` 还是 `connect`，用户都可以直接传参（`p2ptun connect goproxy-tunnel`）或使用 `-id` / `-peer` / `-name`，不再有区分 `-id` 还是 `-peer` 的心智负担。
+* 客户端启动时系统自动为其生成全局唯一的随机 Client ID（格式如 `phone-3b881fe7`）。
+* 因此，家庭电脑、办公笔记本、多部手机可以同时执行同一条简易命令（`p2ptun connect goproxy-tunnel -secret xxx`）并发连接同一个隧道，绝不发生信令碰撞。
 
 ### 6.3 独立的 UDP 5-Tuple 资源隔离
 * 当 Client A（手机）与 Client B（笔记本）同时连入时：

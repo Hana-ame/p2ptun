@@ -7,6 +7,7 @@ MODE="${P2PTUN_MODE:-connect}"
 PEER="${P2PTUN_PEER:-}"
 SECRET="${P2PTUN_SECRET:-}"
 ID="${P2PTUN_ID:-}"
+TUNNEL_NAME="${P2PTUN_NAME:-${PEER:-${ID:-}}}"
 LISTEN="${P2PTUN_LISTEN:-127.0.0.1:2222}"
 TARGET="${P2PTUN_TARGET:-127.0.0.1:22}"
 # 控制面板/状态服务监听地址: 默认不开启 (未指定时不开启 HTTP 状态服务)
@@ -23,6 +24,8 @@ if [ -f "${ENV_FILE}" ]; then
     # shellcheck disable=SC1090
     source "${ENV_FILE}"
     set +a
+    # 重新检查加载后的隧道名配置
+    TUNNEL_NAME="${P2PTUN_NAME:-${P2PTUN_PEER:-${P2PTUN_ID:-${TUNNEL_NAME}}}}"
 fi
 
 BIN="$(command -v p2ptun || true)"
@@ -45,9 +48,8 @@ case "${cmd}" in
         args=("${MODE}" "-daemon" "-pidfile" "${PID_FILE}" "-logfile" "${LOG_FILE}")
         [ -n "${STATUS_ADDR}" ] && args+=("-status-addr" "${STATUS_ADDR}")
         [ -n "${SECRET}" ] && export P2PTUN_SECRET="${SECRET}"
-        [ -n "${ID}" ] && args+=("-id" "${ID}")
+        [ -n "${TUNNEL_NAME}" ] && args+=("-id" "${TUNNEL_NAME}")
         if [ "${MODE}" = "connect" ]; then
-            [ -n "${PEER}" ] && args+=("-peer" "${PEER}")
             args+=("-listen" "${LISTEN}")
         else
             args+=("-target" "${TARGET}")
@@ -100,7 +102,7 @@ exec "\${BIN:-p2ptun}" \${MODE} -daemon -pidfile "\${PID_FILE}" -logfile "\${LOG
 EOF
         chmod +x "${BOOT_SCRIPT}"
         echo "Installed Termux boot script at ${BOOT_SCRIPT}"
-        echo "Save your P2PTUN_PEER and P2PTUN_SECRET in ${ENV_FILE}"
+        echo "Save your P2PTUN_NAME (or P2PTUN_ID/P2PTUN_PEER) and P2PTUN_SECRET in ${ENV_FILE}"
         ;;
     *)
         echo "Usage: $0 {start|stop|restart|status|logs|install-boot} [extra p2ptun flags...]"

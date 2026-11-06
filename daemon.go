@@ -640,7 +640,8 @@ WantedBy=multi-user.target
 # Termux 常驻守护脚本 (可放入 ~/.termux/boot/p2ptun.sh 或直接执行)
 command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock
 
-export P2PTUN_PEER="${P2PTUN_PEER:-wslssh-a1b2}"
+export P2PTUN_NAME="${P2PTUN_NAME:-${P2PTUN_PEER:-${P2PTUN_ID:-wslssh-a1b2}}}"
+export P2PTUN_PEER="${P2PTUN_NAME}"
 export P2PTUN_SECRET="${P2PTUN_SECRET:-hunter2}"
 export P2PTUN_LISTEN="${P2PTUN_LISTEN:-127.0.0.1:2222}"
 export P2PTUN_PROTO="${P2PTUN_PROTO:-hy2}"

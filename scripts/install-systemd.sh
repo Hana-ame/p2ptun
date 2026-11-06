@@ -34,6 +34,7 @@ if [ "${MODE}" = "expose" ]; then
     ENV_PATH="/etc/p2ptun/env"
     SVC_NAME="p2ptun"
     cat > "${ENV_PATH}" <<EOF
+P2PTUN_NAME=${ARG1}
 P2PTUN_ID=${ARG1}
 P2PTUN_SECRET=${SECRET}
 P2PTUN_TARGET=${TARGET}
@@ -46,6 +47,7 @@ elif [ "${MODE}" = "connect" ]; then
     ENV_PATH="/etc/p2ptun/connect.env"
     SVC_NAME="p2ptun-connect"
     cat > "${ENV_PATH}" <<EOF
+P2PTUN_NAME=${ARG1}
 P2PTUN_PEER=${ARG1}
 P2PTUN_SECRET=${SECRET}
 P2PTUN_LISTEN=${LISTEN}

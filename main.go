@@ -66,10 +66,12 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `p2ptun %s - P2P TCP tunnel over PeerJS SCTP scheduling + Native UDP (Hysteria 2 / QUIC)
 
 expose   (run where the TCP service lives, e.g. WSL / Linux server):
-  p2ptun expose -secret SECRET [-id MYID] [-target 127.0.0.1:22] [-proto hy2|quic|classic] [-bandwidth 50] [-daemon]
+  p2ptun expose [TUNNEL_NAME] -secret SECRET [-target 127.0.0.1:22] [-proto hy2|quic|classic] [-bandwidth 50] [-daemon]
+  (隧道名可直接传参，或通过 -id / -peer / -name 指定，认知负荷为零)
 
 connect  (run on the remote client side, e.g. Termux / laptop):
-  p2ptun connect -peer REMOTE_ID -secret SECRET [-listen 127.0.0.1:2222] [-proto hy2|quic|classic] [-bandwidth 50] [-daemon]
+  p2ptun connect [TUNNEL_NAME] -secret SECRET [-listen 127.0.0.1:2222] [-proto hy2|quic|classic] [-bandwidth 50] [-daemon]
+  (目标隧道名可直接传参，或通过 -id / -peer / -name 指定，认知负荷为零)
 
 daemon & management commands:
   p2ptun status  [-mode expose|connect] [-status-addr 127.0.0.1:18222]
@@ -77,8 +79,7 @@ daemon & management commands:
   p2ptun service [systemd|termux] [expose|connect]
 
 common flags (env fallbacks in parens):
-  -id ID            peer id on signaling server            (P2PTUN_ID)
-  -peer ID          remote peer id (connect)               (P2PTUN_PEER)
+  -id, -peer, -name ID  隧道标识/名称 (expose 与 connect 完全通用) (P2PTUN_ID / P2PTUN_PEER / P2PTUN_NAME)
   -secret S         pairing secret, must match both sides  (P2PTUN_SECRET)
   -target H:P       exposed TCP endpoint (expose)          (P2PTUN_TARGET=127.0.0.1:22)
   -listen H:P       local listen addr (connect)            (P2PTUN_LISTEN=127.0.0.1:2222)
@@ -185,13 +186,65 @@ func envDuration(key string, def time.Duration) time.Duration {
 	return def
 }
 
+func extractTunnelPositionalAndFilterArgs(args []string) (string, []string) {
+	var filtered []string
+	var posName string
+	valueFlags := map[string]bool{
+		"id": true, "peer": true, "name": true,
+		"secret": true, "target": true, "listen": true,
+		"broker": true, "key": true, "proto": true,
+		"transport": true, "bandwidth": true, "stun": true,
+		"turn": true, "nat1to1": true, "ice-ports": true,
+		"proxy": true, "keepalive": true, "max-peers": true,
+		"idle-timeout": true, "pidfile": true, "logfile": true,
+		"log-max-mb": true, "status-addr": true, "panel-addr": true,
+		"control-addr": true,
+	}
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			for j := i + 1; j < len(args); j++ {
+				if posName == "" && args[j] != "" {
+					posName = args[j]
+				}
+			}
+			break
+		}
+		if strings.HasPrefix(arg, "-") {
+			flagName := strings.TrimLeft(arg, "-")
+			if eqIdx := strings.Index(flagName, "="); eqIdx >= 0 {
+				filtered = append(filtered, arg)
+			} else if valueFlags[flagName] {
+				filtered = append(filtered, arg)
+				if i+1 < len(args) {
+					i++
+					filtered = append(filtered, args[i])
+				}
+			} else {
+				filtered = append(filtered, arg)
+			}
+		} else {
+			if posName == "" && arg != "" {
+				posName = arg
+			}
+		}
+	}
+	return posName, filtered
+}
+
 func parseConfig(args []string, mode string) (config, error) {
+	posTunnel, filteredArgs := extractTunnelPositionalAndFilterArgs(args)
+
 	fs := flag.NewFlagSet(mode, flag.ContinueOnError)
 	defProto := envOr("P2PTUN_PROTO", envOr("P2PTUN_TRANSPORT", "hy2"))
+
+	envID := strings.TrimSpace(os.Getenv("P2PTUN_ID"))
+	envPeer := strings.TrimSpace(os.Getenv("P2PTUN_PEER"))
+	envName := strings.TrimSpace(os.Getenv("P2PTUN_NAME"))
+
 	cfg := config{
 		mode:          mode,
-		id:            envOr("P2PTUN_ID", ""),
-		peer:          envOr("P2PTUN_PEER", ""),
 		secret:        envOr("P2PTUN_SECRET", ""),
 		target:        envOr("P2PTUN_TARGET", "127.0.0.1:22"),
 		listen:        envOr("P2PTUN_LISTEN", "127.0.0.1:2222"),
@@ -217,8 +270,11 @@ func parseConfig(args []string, mode string) (config, error) {
 		bandwidthMbps: envInt("P2PTUN_BANDWIDTH", 50),
 		useQUIC:       envBoolDefault("P2PTUN_QUIC", true),
 	}
-	fs.StringVar(&cfg.id, "id", cfg.id, "peer id")
-	fs.StringVar(&cfg.peer, "peer", cfg.peer, "remote peer id (connect)")
+
+	var flagID, flagPeer, flagName string
+	fs.StringVar(&flagID, "id", "", "tunnel name or peer id (expose & connect)")
+	fs.StringVar(&flagPeer, "peer", "", "tunnel name or peer id (expose & connect)")
+	fs.StringVar(&flagName, "name", "", "tunnel name (expose & connect)")
 	fs.StringVar(&cfg.secret, "secret", cfg.secret, "pairing secret")
 	fs.StringVar(&cfg.target, "target", cfg.target, "target tcp endpoint (expose)")
 	fs.StringVar(&cfg.listen, "listen", cfg.listen, "local listen addr (connect)")
@@ -254,8 +310,12 @@ func parseConfig(args []string, mode string) (config, error) {
 	fs.StringVar(&controlAddrAlias, "control-addr", "", "alias for -status-addr")
 	fs.BoolVar(&cfg.useQUIC, "quic", cfg.useQUIC, "use QUIC/Hysteria2 transport (set -quic=false for classic)")
 
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(filteredArgs); err != nil {
 		return cfg, err
+	}
+
+	if posTunnel == "" && fs.NArg() > 0 {
+		posTunnel = fs.Arg(0)
 	}
 
 	if panelAddrAlias != "" {
@@ -287,14 +347,75 @@ func parseConfig(args []string, mode string) (config, error) {
 	}
 	cfg.broker = cfg.brokers[0]
 
-	if cfg.id != "" {
-		cfg.idExplicit = true
-	} else {
-		cfg.id = map[string]string{"expose": "wslssh", "connect": "phone"}[mode] + "-" + randHex(4)
+	if mode == "expose" {
+		tunnelName := ""
+		for _, v := range []string{posTunnel, flagID, flagName, flagPeer, envID, envName, envPeer} {
+			if v != "" {
+				tunnelName = v
+				break
+			}
+		}
+		if tunnelName != "" {
+			cfg.id = tunnelName
+			cfg.idExplicit = true
+		} else {
+			cfg.id = "wslssh-" + randHex(4)
+			cfg.idExplicit = false
+		}
+	} else if mode == "connect" {
+		targetPeer := ""
+		customClientID := ""
+
+		if posTunnel != "" {
+			targetPeer = posTunnel
+			if flagID != "" {
+				customClientID = flagID
+			} else if flagPeer != "" && flagPeer != posTunnel {
+				targetPeer = flagPeer
+			}
+		} else if flagPeer != "" {
+			targetPeer = flagPeer
+			if flagID != "" {
+				customClientID = flagID
+			}
+		} else if flagName != "" {
+			targetPeer = flagName
+			if flagID != "" {
+				customClientID = flagID
+			}
+		} else if flagID != "" {
+			// 在 connect 模式下单独传入 -id，直接作为目标隧道名称处理，消除记忆负担
+			targetPeer = flagID
+		} else {
+			if envPeer != "" {
+				targetPeer = envPeer
+				if envID != "" && envID != envPeer {
+					customClientID = envID
+				}
+			} else if envName != "" {
+				targetPeer = envName
+				if envID != "" && envID != envName {
+					customClientID = envID
+				}
+			} else if envID != "" {
+				targetPeer = envID
+			}
+		}
+
+		if targetPeer == "" {
+			return cfg, fmt.Errorf("connect: 请指定目标隧道名称 (-id, -peer, -name 或直接传参: p2ptun connect <隧道名>)")
+		}
+		cfg.peer = targetPeer
+
+		if customClientID != "" {
+			cfg.id = customClientID
+			cfg.idExplicit = true
+		} else {
+			cfg.id = "phone-" + randHex(4)
+			cfg.idExplicit = false
+		}
 	}
-	if mode == "connect" && cfg.peer == "" {
-		return cfg, fmt.Errorf("connect: -peer REMOTE_ID is required")
-	}
+
 	if cfg.secret == "" {
 		return cfg, fmt.Errorf("%s: -secret is required", mode)
 	}
@@ -806,7 +927,7 @@ func (m *exposeManager) runSignalingLoop() error {
 	if defPort == "" {
 		defPort = "1080"
 	}
-	log.Printf("expose: [客户端连接命令] ➔ p2ptun connect -peer %s -secret <SECRET> -listen 127.0.0.1:%s -proto %s -bandwidth %d",
+	log.Printf("expose: [客户端连接命令] ➔ p2ptun connect %s -secret <SECRET> -listen 127.0.0.1:%s -proto %s -bandwidth %d (支持位置参数、-id 或 -peer)",
 		m.cfg.id, defPort, m.cfg.effectiveProto(), m.cfg.bandwidthMbps)
 
 	select {
