@@ -115,15 +115,17 @@ func (c *dcPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 }
 
 func (c *dcPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	// 背压: DataChannel 缓冲超过 512KB 时等待 OnBufferedAmountLow 唤醒。
+	// 原实现里 for 体内的 select 每个分支后面都跟着无条件 break,
+	// 循环体最多执行一次, 背压等于完全失效; 同时 lowCh 只有 1 个 token,
+	// 多协程等待时只有一个能被唤醒, 所以这里用短超时轮询兜底。
 	for c.dc.BufferedAmount() > (512 << 10) {
 		select {
 		case <-c.done:
 			return 0, io.EOF
 		case <-c.lowCh:
 		case <-time.After(15 * time.Millisecond):
-			break
 		}
-		break
 	}
 	select {
 	case <-c.done:

@@ -11,10 +11,12 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"math/big"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -63,24 +65,49 @@ func init() {
 	}
 }
 
-// normalizeProto 统一规范化协议名称:
-//   - "hy2" / "hysteria2" / "hysteria" -> "hy2" (默认: 原生 ICE UDP + Hysteria 2 Brutal CC)
-//   - "quic" -> "quic" (原生 ICE UDP + QUIC)
-//   - "dc-quic" -> "dc-quic" (WebRTC DataChannel 承载 QUIC)
-//   - "classic" / "sctp" / "dc" -> "classic" (WebRTC DataChannel 多路复用帧)
-func normalizeProto(raw string) string {
-	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "hy2", "hysteria2", "hysteria":
-		return "hy2"
-	case "quic":
-		return "quic"
-	case "dc-quic", "dcquic":
-		return "dc-quic"
-	case "classic", "sctp", "dc", "datachannel":
-		return "classic"
-	default:
-		return "hy2"
+// protoAliases 是 -proto 的合法取值及其规范名.
+// 注意: 别名表是唯一事实来源, 校验/规范化/错误提示都从这里取, 避免各处不同步.
+var protoAliases = map[string]string{
+	"hy2": "hy2", "hysteria2": "hy2", "hysteria": "hy2",
+	"quic":    "quic",
+	"dc-quic": "dc-quic", "dcquic": "dc-quic",
+	"classic": "classic", "sctp": "classic", "dc": "classic", "datachannel": "classic",
+}
+
+// validProtoList 返回排序后的合法 -proto 取值, 用于报错提示.
+// canonicalProtos 是 -proto 的四个正式取值, 顺序固定便于用户阅读.
+// 别名 (hysteria2 / sctp / dc ...) 仍可接受, 但不进错误提示:
+// 提示里塞 10 个别名只会让人困惑"到底该填哪个".
+var canonicalProtos = []string{"hy2", "quic", "classic", "dc-quic"}
+
+func validProtoList() string {
+	out := make([]string, len(canonicalProtos))
+	copy(out, canonicalProtos)
+	sort.Strings(out)
+	return strings.Join(out, ", ")
+}
+
+// parseProto 严格解析用户输入: 未知值返回错误而不是静默回落.
+// 早期实现在 default 分支直接 return "hy2", 导致 -proto quik 这类拼写错误
+// 会毫无提示地跑在默认协议上, 排障时极难发现.
+func parseProto(raw string) (string, error) {
+	key := strings.ToLower(strings.TrimSpace(raw))
+	if key == "" {
+		return "hy2", nil
 	}
+	if p, ok := protoAliases[key]; ok {
+		return p, nil
+	}
+	return "", fmt.Errorf("invalid -proto %q: expected one of %s", raw, validProtoList())
+}
+
+// normalizeProto 宽松规范化, 仅用于处理对端通过网络传来的协议名.
+// 对端数据不可信, 不能因为一个陌生值就让本端启动失败, 因此未知时回落默认值.
+func normalizeProto(raw string) string {
+	if p, err := parseProto(raw); err == nil {
+		return p
+	}
+	return "hy2"
 }
 
 // icePacketConn wraps *ice.Conn into net.PacketConn for QUIC and Hysteria 2
@@ -198,9 +225,14 @@ func wireControlChannel(dc *webrtc.DataChannel, onOpenExtra ...func()) (<-chan w
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
 		cp := make([]byte, len(msg.Data))
 		copy(cp, msg.Data)
+		out := webrtc.DataChannelMessage{Data: cp, IsString: msg.IsString}
+		// 控制通道消息必须在打洞窗口内完整送达: 早期用 default 直接丢弃,
+		// 一旦 ICE 候选分批上报出现 burst, 候选丢失会让打洞随机失败且日志无任何痕迹.
+		// 这里阻塞交给唯一消费协程, 并设上限避免异常情况下永久卡住 SCTP 回调.
 		select {
-		case msgCh <- webrtc.DataChannelMessage{Data: cp, IsString: msg.IsString}:
-		default:
+		case msgCh <- out:
+		case <-time.After(5 * time.Second):
+			log.Printf("control channel: consumer stalled >5s, dropping %d-byte message", len(cp))
 		}
 	})
 	return msgCh, openCh

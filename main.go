@@ -66,11 +66,11 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `p2ptun %s - P2P TCP tunnel over PeerJS SCTP scheduling + Native UDP (Hysteria 2 / QUIC)
 
 expose   (run where the TCP service lives, e.g. WSL / Linux server):
-  p2ptun expose [TUNNEL_NAME] -secret SECRET [-target 127.0.0.1:22] [-proto hy2|quic|classic] [-bandwidth 50] [-daemon]
+  p2ptun expose [TUNNEL_NAME] -secret SECRET [-target 127.0.0.1:22] [-proto hy2|quic|classic|dc-quic] [-bandwidth 50] [-daemon]
   (隧道名可直接传参，或通过 -id / -peer / -name 指定，认知负荷为零)
 
 connect  (run on the remote client side, e.g. Termux / laptop):
-  p2ptun connect [TUNNEL_NAME] -secret SECRET [-listen 127.0.0.1:2222] [-proto hy2|quic|classic] [-bandwidth 50] [-daemon]
+  p2ptun connect [TUNNEL_NAME] -secret SECRET [-listen 127.0.0.1:2222] [-proto hy2|quic|classic|dc-quic] [-bandwidth 50] [-daemon]
   (目标隧道名可直接传参，或通过 -id / -peer / -name 指定，认知负荷为零)
 
 daemon & management commands:
@@ -83,7 +83,7 @@ common flags (env fallbacks in parens):
   -secret S         pairing secret, must match both sides  (P2PTUN_SECRET)
   -target H:P       exposed TCP endpoint (expose)          (P2PTUN_TARGET=127.0.0.1:22)
   -listen H:P       local listen addr (connect)            (P2PTUN_LISTEN=127.0.0.1:2222)
-  -proto P          transport protocol: hy2, quic, classic (P2PTUN_PROTO=hy2)
+  -proto P          transport: hy2, quic, classic, dc-quic  (P2PTUN_PROTO=hy2)
   -bandwidth MB     Brutal CC target bandwidth in Mbps     (P2PTUN_BANDWIDTH=50)
   -broker CSV       signaling brokers, comma-separated     (P2PTUN_BROKER=%s)
   -key K            PeerJS api key                         (P2PTUN_KEY=peerjs)
@@ -280,7 +280,7 @@ func parseConfig(args []string, mode string) (config, error) {
 	fs.StringVar(&cfg.listen, "listen", cfg.listen, "local listen addr (connect)")
 	fs.StringVar(&cfg.broker, "broker", cfg.broker, "signaling broker URL(s), comma separated")
 	fs.StringVar(&cfg.key, "key", cfg.key, "PeerJS api key")
-	fs.StringVar(&cfg.proto, "proto", cfg.proto, "transport protocol: hy2 (default), quic, classic")
+	fs.StringVar(&cfg.proto, "proto", cfg.proto, "transport protocol: hy2 (default), quic, classic, dc-quic")
 	transportAlias := ""
 	fs.StringVar(&transportAlias, "transport", "", "alias for -proto (hy2, quic, classic)")
 	fs.IntVar(&cfg.bandwidthMbps, "bandwidth", cfg.bandwidthMbps, "target bandwidth in Mbps for Hysteria 2 Brutal CC")
@@ -327,10 +327,18 @@ func parseConfig(args []string, mode string) (config, error) {
 	if transportAlias != "" {
 		cfg.proto = transportAlias
 	}
-	cfg.proto = normalizeProto(cfg.proto)
 	if !cfg.useQUIC {
+		// 旧开关 -quic=false 仍受支持, 但会覆盖 -proto; 显式提示一句, 免得新旧配置混用时莫名其妙变成 classic.
+		if cfg.proto != "" && normalizeProto(cfg.proto) != "classic" {
+			log.Printf("warning: -quic=false overrides -proto %q, forcing classic", cfg.proto)
+		}
 		cfg.proto = "classic"
 	}
+	proto, err := parseProto(cfg.proto)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.proto = proto
 
 	if stun != "" {
 		cfg.stun = splitCSV(stun)
@@ -424,6 +432,18 @@ func parseConfig(args []string, mode string) (config, error) {
 	}
 	if cfg.bandwidthMbps <= 0 {
 		cfg.bandwidthMbps = 50
+	}
+
+	// 提前校验端点格式: 否则错误会推迟到第一次真实连接时才暴露,
+	// 而那时用户往往只看到 "dial tcp: address bad: missing port in address",
+	// 很难定位到是最初的 -target / -listen 参数写错了.
+	if err := validateEndpoint("target", cfg.target); err != nil {
+		return cfg, err
+	}
+	if mode == "connect" {
+		if err := validateEndpoint("listen", cfg.listen); err != nil {
+			return cfg, err
+		}
 	}
 
 	configuredProxy.Store(&cfg.proxy)
@@ -1249,20 +1269,24 @@ func runConnect(args []string) {
 	}
 	defer cleanup()
 
-	log.Printf("connect: starting (id=%s, peer=%s, listen=%s, proto=%s, bandwidth=%dMbps, brokers=%s, on_demand=%v)",
-		cfg.id, cfg.peer, cfg.listen, cfg.effectiveProto(), cfg.bandwidthMbps, strings.Join(cfg.brokers, ","), cfg.onDemand)
-
 	lis, err := net.Listen("tcp", cfg.listen)
 	if err != nil {
 		log.Fatalf("connect: listen %s: %v", cfg.listen, err)
 	}
 	defer lis.Close()
-	portStr := portOf(cfg.listen)
+	// 使用实际监听地址而不是配置串: -listen 127.0.0.1:0 时内核会分配真实端口,
+	// 若照抄配置串, 打印出来的连接命令会变成 127.0.0.1:0 这种无效提示.
+	actualListen := lis.Addr().String()
+
+	// 启动摘要放在 listen 之后, 这样 -listen :0 时打的是真实端口而不是 ":0".
+	log.Printf("connect: starting (id=%s, peer=%s, listen=%s, proto=%s, bandwidth=%dMbps, brokers=%s, on_demand=%v)",
+		cfg.id, cfg.peer, actualListen, cfg.effectiveProto(), cfg.bandwidthMbps, strings.Join(cfg.brokers, ","), cfg.onDemand)
+	portStr := portOf(actualListen)
 	tipStr := fmt.Sprintf("代理测试: curl -x http://127.0.0.1:%s -I https://www.google.com", portStr)
 	if portStr == "22" || portStr == "2222" {
 		tipStr = fmt.Sprintf("SSH 命令: ssh -p %s user@127.0.0.1", portStr)
 	}
-	log.Printf("connect: listening on %s (提示: %s)", cfg.listen, tipStr)
+	log.Printf("connect: listening on %s (提示: %s)", actualListen, tipStr)
 
 	stop := make(chan struct{})
 	var stopOnce sync.Once
@@ -1275,7 +1299,7 @@ func runConnect(args []string) {
 	globalStats.mode = "connect"
 	globalStats.peerID = cfg.id
 	globalStats.remotePeer = cfg.peer
-	globalStats.targetOrLis = cfg.listen
+	globalStats.targetOrLis = actualListen
 	globalStats.setTransport(cfg.effectiveProto(), "")
 
 	connCh := make(chan pendingConn, 128)
@@ -1451,6 +1475,27 @@ func portOf(addr string) string {
 		return addr
 	}
 	return p
+}
+
+// validateEndpoint 校验 host:port 形式的端点. 端口允许为 0 (由内核分配),
+// 但主机部分必须可解析、端口必须在 1..65535 或为 0.
+func validateEndpoint(flagName, addr string) error {
+	example := "127.0.0.1:22"
+	if flagName == "listen" {
+		example = "127.0.0.1:2222"
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("invalid -%s %q: expected host:port, e.g. %s", flagName, addr, example)
+	}
+	p, err := strconv.Atoi(port)
+	if err != nil || p < 0 || p > 65535 {
+		return fmt.Errorf("invalid -%s %q: port must be 0-65535, got %q", flagName, addr, port)
+	}
+	if host == "" && flagName == "target" {
+		return fmt.Errorf("invalid -%s %q: host must not be empty", flagName, addr)
+	}
+	return nil
 }
 
 type tunnelSess struct {

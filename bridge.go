@@ -448,9 +448,14 @@ func (r *streamReg) allocID() uint32 {
 
 func (r *streamReg) add(s *stream) {
 	r.mu.Lock()
-	_, existed := r.streams[s.id]
+	prev, existed := r.streams[s.id]
 	r.streams[s.id] = s
 	r.mu.Unlock()
+	// 同一 id 被覆盖时先停掉旧流, 否则旧流的 TCP 连接会一直挂着.
+	if existed && prev != nil && prev != s {
+		prev.stop()
+		return
+	}
 	if !existed {
 		globalStats.activeStreams.Add(1)
 	}
@@ -464,8 +469,7 @@ func (r *streamReg) get(id uint32) *stream {
 
 func (r *streamReg) remove(id uint32) *stream {
 	r.mu.Lock()
-	s := r.streams[id]
-	_, existed := r.streams[id]
+	s, existed := r.streams[id]
 	delete(r.streams, id)
 	r.mu.Unlock()
 	if existed {
