@@ -584,3 +584,67 @@ func TestUnifiedIDAndPeerFlags(t *testing.T) {
 		t.Fatalf("P2PTUN_NAME in connect failed: %v, peer=%s", err, cfg.peer)
 	}
 }
+
+// -proto 拼写错误必须立刻报错, 不能静默回落 hy2.
+// 回归点: 早期 normalizeProto 的 default 分支直接返回 "hy2",
+// 导致 -proto quik 这类错字毫无提示地跑在默认协议上.
+func TestProtoStrictValidation(t *testing.T) {
+	// 1. 未知协议直接报错, 且错误里列出全部合法值
+	for _, bad := range []string{"quik", "hy3", "quic-", "none"} {
+		_, err := parseConfig([]string{"-secret", "s", "-id", "t", "-proto", bad}, "expose")
+		if err == nil || !strings.Contains(err.Error(), "invalid -proto") {
+			t.Fatalf("expected invalid -proto error for %q, got: %v", bad, err)
+		}
+		if !strings.Contains(err.Error(), "hy2") || !strings.Contains(err.Error(), "classic") {
+			t.Fatalf("error for %q should list valid values, got: %v", bad, err)
+		}
+	}
+
+	// 2. 合法值与别名都能正确规范化
+	cases := map[string]string{
+		"hy2": "hy2", "hysteria2": "hy2", "Hysteria": "hy2",
+		"quic": "quic", "QUIC": "quic",
+		"classic": "classic", "sctp": "classic", "dc": "classic", "datachannel": "classic",
+		"dc-quic": "dc-quic", "dcquic": "dc-quic",
+	}
+	for in, want := range cases {
+		cfg, err := parseConfig([]string{"-secret", "s", "-id", "t", "-proto", in}, "expose")
+		if err != nil {
+			t.Fatalf("-proto %q should be valid, got: %v", in, err)
+		}
+		if cfg.proto != want {
+			t.Fatalf("-proto %q => %q, want %q", in, cfg.proto, want)
+		}
+	}
+
+	// 3. -transport 别名同样受校验
+	if _, err := parseConfig([]string{"-secret", "s", "-id", "t", "-transport", "nope"}, "expose"); err == nil {
+		t.Fatal("expected invalid -transport to be rejected")
+	}
+
+	// 4. 对端传来的未知协议仍宽松回落, 不能因为陌生值让本端崩掉
+	if got := normalizeProto("something-from-peer"); got != "hy2" {
+		t.Fatalf("normalizeProto should fall back to hy2 for unknown peer value, got %q", got)
+	}
+}
+
+// -target / -listen 格式错误必须在参数解析阶段就拒绝,
+// 而不是等到第一次真实连接才暴露.
+func TestEndpointValidation(t *testing.T) {
+	for _, bad := range []string{"bad", "127.0.0.1", ":22x", "1.2.3.4:99999"} {
+		if _, err := parseConfig([]string{"-secret", "s", "-id", "t", "-target", bad}, "expose"); err == nil {
+			t.Fatalf("expected -target %q to be rejected", bad)
+		}
+	}
+	for _, bad := range []string{"nope", "127.0.0.1:xx"} {
+		if _, err := parseConfig([]string{"-secret", "s", "peer", "-listen", bad}, "connect"); err == nil {
+			t.Fatalf("expected -listen %q to be rejected", bad)
+		}
+	}
+	// 合法值必须通过 (含 :0 让内核分配端口)
+	for _, good := range []string{"127.0.0.1:22", "localhost:8080", "[::1]:22", "0.0.0.0:0"} {
+		if _, err := parseConfig([]string{"-secret", "s", "-id", "t", "-target", good}, "expose"); err != nil {
+			t.Fatalf("-target %q should be valid, got: %v", good, err)
+		}
+	}
+}

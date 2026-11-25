@@ -1,0 +1,43 @@
+name: test
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: gofmt
+        run: |
+          fmt_out=$(gofmt -l .)
+          if [ -n "$fmt_out" ]; then
+            echo "::error::these files are not gofmt'd:"
+            echo "$fmt_out"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test (race)
+        run: go test -race -timeout 600s ./...
+
+      - name: go build
+        run: CGO_ENABLED=0 go build -trimpath -o /dev/null .
